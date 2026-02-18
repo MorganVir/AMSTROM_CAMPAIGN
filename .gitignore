@@ -216,3 +216,8 @@ cython_debug/
 ## Specific to the project ##
 # Ignore directories with prefix trash
 trash*/
+*.xlsx
+*.csv
+*.pkl
+*.txt
+*.png
