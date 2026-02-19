@@ -226,3 +226,6 @@ trash*/
 *.xlsx
 *.pkl
 *.csv
+
+#cache (derived from running the pipeline)
+/data/derived
