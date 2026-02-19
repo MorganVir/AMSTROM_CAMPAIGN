@@ -226,6 +226,10 @@ trash*/
 *.xlsx
 *.pkl
 *.csv
+<<<<<<< Updated upstream
 
 #cache (derived from running the pipeline)
 /data/derived
+=======
+*.parquet
+>>>>>>> Stashed changes
