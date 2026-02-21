@@ -56,8 +56,8 @@ NIRS_COL_NAMES = [
 nirs_txt_path = RAW_NIRS_DIR / f"{RUN_ID}_NIRS.txt"
 assert nirs_txt_path.exists(), f"NIRS file not found: {nirs_txt_path}"
 
-cache_compact_path = CACHE_07_NIRS_IMPORT.parent / "nirs_compact.parquet"
-cache_report_path  = CACHE_07_NIRS_IMPORT.parent / "nirs_import_report.parquet"
+cache_compact_path = CACHE_07_NIRS_IMPORT.parent / "07_nirs_compact.parquet"
+cache_report_path  = CACHE_07_NIRS_IMPORT.parent / "07_nirs_import_report.parquet"
 
 # ----------------------------
 # Cache hit
