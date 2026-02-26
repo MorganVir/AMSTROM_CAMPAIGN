@@ -11,6 +11,8 @@ assert "RUN_ID" in globals()
 assert "master_index_grid" in globals()
 assert "torque_compact_df" in globals()
 assert "CACHE_04_VC_KNOBS_EVENTS" in globals()
+assert "emg_compact_df" in globals() and isinstance(emg_compact_df, pd.DataFrame), "emg_compact_df missing/invalid"
+
 
 TORQUE_COL = "torque_raw"
 VC_QC_PLOT_DECIM = 500
@@ -136,10 +138,32 @@ for seq_name, thr_frac in thr_frac_by_seq.items():
 vc_events_df = pd.DataFrame(event_rows)
 
 
-# Apply labels
+# Apply VC labels
 master_index_grid_out = master_index_grid.copy()
 master_index_grid_out["VC"] = VC
 master_index_grid_out["VC_count"] = VC_count
+
+
+# ... and propagate VC labels to compact tables (emg & torque) via time_index
+
+master_VC = master_index_grid_out["VC"].to_numpy(dtype=int)
+master_VC_count = master_index_grid_out["VC_count"].to_numpy(dtype=int)
+
+torque_time_index = torque_compact_df["time_index"].to_numpy(dtype=int)
+assert torque_time_index.size > 0, "torque_compact_df has zero rows"
+assert int(np.max(torque_time_index)) < len(master_index_grid_out), "torque time_index out of master range"
+
+torque_compact_df_out = torque_compact_df.copy()
+torque_compact_df_out["VC"] = master_VC[torque_time_index]
+torque_compact_df_out["VC_count"] = master_VC_count[torque_time_index]
+
+emg_time_index = emg_compact_df["time_index"].to_numpy(dtype=int)
+assert emg_time_index.size > 0, "emg_compact_df has zero rows"
+assert int(np.max(emg_time_index)) < len(master_index_grid_out), "emg time_index out of master range"
+
+emg_compact_df_out = emg_compact_df.copy()
+emg_compact_df_out["VC"] = master_VC[emg_time_index]
+emg_compact_df_out["VC_count"] = master_VC_count[emg_time_index]
 
 # Commit only if requested
 VC_COMMIT = bool(globals().get("VC_COMMIT", False))

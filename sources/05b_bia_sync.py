@@ -1,6 +1,5 @@
 # ============================================================
 # 06_bia_sync — estimate lag in MVC_REF using real BIA samples only
-# - NO ZOH / NO ffill / NO upsampling to master grid
 # - Objective (legacy v1): maximize |mean(|Z| in VC) - mean(|Z| out VC)| within MVC_REF
 # - Apply best shift to bia2 + bia4 by shifting time_index, then relabel from master
 # - Out-of-range after shift: DROP (never clip)
@@ -22,12 +21,12 @@ assert "master_index_grid" in globals() and isinstance(master_index_grid, pd.Dat
 assert "bia2_compact_df" in globals() and isinstance(bia2_compact_df, pd.DataFrame), "bia2_compact_df missing/invalid"
 assert "bia4_compact_df" in globals() and isinstance(bia4_compact_df, pd.DataFrame), "bia4_compact_df missing/invalid"
 
-assert "bia4_freqs_hz" in globals(), "bia4_freqs_hz missing (from Step 05)"
+assert "bia4_freqs_hz" in globals(), "bia4_freqs_hz missing (from Step 05a)"
 bia4_freqs_hz = np.asarray(bia4_freqs_hz, dtype=float)
 assert bia4_freqs_hz.ndim == 1 and bia4_freqs_hz.size > 0, "bia4_freqs_hz must be 1D non-empty"
 
-assert "CACHE_06_BIA_SYNC" in globals(), "CACHE_06_BIA_SYNC missing"
-CACHE_06_BIA_SYNC = Path(CACHE_06_BIA_SYNC)
+assert "CACHE_05b_BIA_SYNC" in globals(), "CACHE_05b_BIA_SYNC missing"
+CACHE_06_BIA_SYNC = Path(CACHE_05b_BIA_SYNC)
 
 # Dashboard-owned knobs/flags (no defaults here)
 assert "BIA_SYNC_ANCHOR_SEQ" in globals(), "BIA_SYNC_ANCHOR_SEQ missing"
@@ -36,8 +35,7 @@ assert "BIA_SYNC_LAG_MIN_S" in globals(), "BIA_SYNC_LAG_MIN_S missing"
 assert "BIA_SYNC_LAG_MAX_S" in globals(), "BIA_SYNC_LAG_MAX_S missing"
 assert "BIA_SYNC_LAG_STEP_S" in globals(), "BIA_SYNC_LAG_STEP_S missing"
 assert "BIA_SYNC_MANUAL_NUDGE_S" in globals(), "BIA_SYNC_MANUAL_NUDGE_S missing"
-assert "BIA_SYNC_PLOT" in globals(), "BIA_SYNC_PLOT missing"
-assert "BIA_SYNC_COMMIT" in globals(), "BIA_SYNC_COMMIT missing"
+
 
 anchor_seq_name = str(BIA_SYNC_ANCHOR_SEQ)
 target_hz = float(BIA_SYNC_TARGET_HZ)
@@ -48,15 +46,15 @@ target_hz = float(BIA_SYNC_TARGET_HZ)
 cache_dir = CACHE_06_BIA_SYNC.parent
 cache_dir.mkdir(parents=True, exist_ok=True)
 
-P_BIA2_ALIGNED = cache_dir / "06_bia2_compact_aligned.parquet"
-P_BIA4_ALIGNED = cache_dir / "06_bia4_compact_aligned.parquet"
-P_REPORT       = cache_dir / "06_bia_sync_report.parquet"
+P_BIA2_ALIGNED = cache_dir / "05b_bia2_compact_aligned.parquet"
+P_BIA4_ALIGNED = cache_dir / "05b_bia4_compact_aligned.parquet"
+
 
 # Cache hit: load and return
-if P_BIA2_ALIGNED.exists() and P_BIA4_ALIGNED.exists() and P_REPORT.exists():
+if P_BIA2_ALIGNED.exists() and P_BIA4_ALIGNED.exists():
     bia2_compact_aligned_df_out = pd.read_parquet(P_BIA2_ALIGNED)
     bia4_compact_aligned_df_out = pd.read_parquet(P_BIA4_ALIGNED)
-    bia_sync_report_df_out      = pd.read_parquet(P_REPORT)
+    print("Cache found. Skipping sync and loading aligned BIA parquets instead.")
 
     # minimal schema asserts
     for df_name, df in [("bia2_aligned", bia2_compact_aligned_df_out), ("bia4_aligned", bia4_compact_aligned_df_out)]:
@@ -229,169 +227,127 @@ else:
     bia4_compact_aligned_df_out, bia4_stats = _shift_drop_and_relabel(bia4_compact_df)
 
     # ----------------------------
-    # Report 
+    # TUNNING PLOT
     # ----------------------------
-    bia_sync_report_df_out = pd.DataFrame([{
-        "RUN_ID": RUN_ID,
-        "anchor_seq": anchor_seq_name,
-        "target_hz": target_hz,
-        "freq_used_hz": freq_used_hz,
-        "fs_ref_hz": float(master_fs_hz),
+    # ---- hard contracts (minimal) ----
+    assert "torque_compact_df" in globals() and isinstance(torque_compact_df, pd.DataFrame), "torque_compact_df missing/invalid"
+    assert "time_index" in torque_compact_df.columns, "torque_compact_df missing time_index"
+    assert "TORQUE_COL" in globals(), "TORQUE_COL missing"
+    TORQUE_COL = str(TORQUE_COL)
+    assert TORQUE_COL in torque_compact_df.columns, f"torque_compact_df missing {TORQUE_COL}"
 
-        "lag_min_s": lag_min_s,
-        "lag_max_s": lag_max_s,
-        "lag_step_s": lag_step_s,
+    # MVC_REF window on master
+    mvc_mask = (master_index_grid["SEQ"].to_numpy() == "MVC_REF")
+    mvc_idx = np.where(mvc_mask)[0]
+    assert mvc_idx.size > 0, "MVC_REF not found in master_index_grid['SEQ']"
+    mvc_i0 = int(mvc_idx[0])
+    mvc_i1 = int(mvc_idx[-1])
 
-        "best_lag_s_auto": best_lag_s_auto,
-        "best_shift_samples_auto": int(best_shift_samples_auto),
+    # VC borders within MVC_REF
+    vc_mask = (master_index_grid["VC_count"].to_numpy(dtype=int) > 0)
+    mask_vc_mvc = mvc_mask & vc_mask
+    d = np.diff(mask_vc_mvc.astype(int))
+    starts = np.where(d == 1)[0] + 1
+    stops  = np.where(d == -1)[0]
+    if mask_vc_mvc[0]:
+        starts = np.r_[0, starts]
+    if mask_vc_mvc[-1]:
+        stops = np.r_[stops, len(mask_vc_mvc) - 1]
 
-        "manual_nudge_s": manual_nudge_s,
-        "total_lag_s": float(total_lag_s),
-        "total_shift_samples": int(total_shift_samples),
+    # torque points restricted to MVC_REF (plot directly, no master-length fill)
+    torque_time_index = torque_compact_df["time_index"].to_numpy(dtype=int)
+    torque_values = torque_compact_df[TORQUE_COL].to_numpy(dtype=float)
+    torque_in_mvc = (torque_time_index >= mvc_i0) & (torque_time_index <= mvc_i1)
 
-        "score_peak": float(scores[best_score_idx]),
+    # hard freq
+    freq_tag = "9760"
+    bia4_R_col = f"bia4_R_ohm__f_{freq_tag}Hz"
+    bia4_Xc_col = f"bia4_Xc_ohm__f_{freq_tag}Hz"
 
-        "bia2_n_total": bia2_stats["n_total"],
-        "bia2_n_valid": bia2_stats["n_valid"],
-        "bia2_drop_low": bia2_stats["n_drop_low"],
-        "bia2_drop_high": bia2_stats["n_drop_high"],
+    for df_name, df in [("bia4_compact_df", bia4_compact_df), ("bia4_compact_aligned_df_out", bia4_compact_aligned_df_out)]:
+        assert "time_index" in df.columns, f"{df_name} missing time_index"
+        assert bia4_R_col in df.columns, f"{df_name} missing {bia4_R_col}"
+        assert bia4_Xc_col in df.columns, f"{df_name} missing {bia4_Xc_col}"
 
-        "bia4_n_total": bia4_stats["n_total"],
-        "bia4_n_valid": bia4_stats["n_valid"],
-        "bia4_drop_low": bia4_stats["n_drop_low"],
-        "bia4_drop_high": bia4_stats["n_drop_high"],
-    }])
+    # ---- extract BIA scatter in MVC_REF (raw) ----
+    bia4_raw_time_index = bia4_compact_df["time_index"].to_numpy(dtype=int)
+    bia4_raw_absZ = np.sqrt(
+        bia4_compact_df[bia4_R_col].to_numpy(dtype=float) ** 2
+        + bia4_compact_df[bia4_Xc_col].to_numpy(dtype=float) ** 2
+    )
+    raw_in_mvc = (bia4_raw_time_index >= mvc_i0) & (bia4_raw_time_index <= mvc_i1)
+    x_raw = bia4_raw_time_index[raw_in_mvc]
+    y_raw = bia4_raw_absZ[raw_in_mvc]
+    order = np.argsort(x_raw)
+    x_raw = x_raw[order]
+    y_raw = y_raw[order]
 
-    # ----------------------------
-    # Optional plot (TUNE)
-    # ----------------------------
-    if bool(BIA_SYNC_PLOT):
-       # ---- hard contracts (minimal) ----
-        assert "torque_compact_df" in globals() and isinstance(torque_compact_df, pd.DataFrame), "torque_compact_df missing/invalid"
-        assert "time_index" in torque_compact_df.columns, "torque_compact_df missing time_index"
-        assert "TORQUE_COL" in globals(), "TORQUE_COL missing"
-        TORQUE_COL = str(TORQUE_COL)
-        assert TORQUE_COL in torque_compact_df.columns, f"torque_compact_df missing {TORQUE_COL}"
+    # ---- extract BIA scatter in MVC_REF (aligned) ----
+    bia4_aln_time_index = bia4_compact_aligned_df_out["time_index"].to_numpy(dtype=int)
+    bia4_aln_absZ = np.sqrt(
+        bia4_compact_aligned_df_out[bia4_R_col].to_numpy(dtype=float) ** 2
+        + bia4_compact_aligned_df_out[bia4_Xc_col].to_numpy(dtype=float) ** 2
+    )
+    aln_in_mvc = (bia4_aln_time_index >= mvc_i0) & (bia4_aln_time_index <= mvc_i1)
+    x_aln = bia4_aln_time_index[aln_in_mvc]
+    y_aln = bia4_aln_absZ[aln_in_mvc]
+    order = np.argsort(x_aln)
+    x_aln = x_aln[order]
+    y_aln = y_aln[order]
 
-        # MVC_REF window on master
-        mvc_mask = (master_index_grid["SEQ"].to_numpy() == "MVC_REF")
-        mvc_idx = np.where(mvc_mask)[0]
-        assert mvc_idx.size > 0, "MVC_REF not found in master_index_grid['SEQ']"
-        mvc_i0 = int(mvc_idx[0])
-        mvc_i1 = int(mvc_idx[-1])
+    # lag text
+    lag_txt = f" (lag {total_lag_s:+0.2f}s | auto {best_lag_s_auto:+0.2f}s + nudge {manual_nudge_s:+0.2f}s)"
 
-        # VC borders within MVC_REF
-        vc_mask = (master_index_grid["VC_count"].to_numpy(dtype=int) > 0)
-        mask_vc_mvc = mvc_mask & vc_mask
-        d = np.diff(mask_vc_mvc.astype(int))
-        starts = np.where(d == 1)[0] + 1
-        stops  = np.where(d == -1)[0]
-        if mask_vc_mvc[0]:
-            starts = np.r_[0, starts]
-        if mask_vc_mvc[-1]:
-            stops = np.r_[stops, len(mask_vc_mvc) - 1]
+    # ---- plot: 2 columns (BEFORE vs AFTER), each torque + bia ----
+    fig, axes = plt.subplots(2, 2, figsize=(14, 7), sharex="col")
 
-        # torque points restricted to MVC_REF (plot directly, no master-length fill)
-        torque_time_index = torque_compact_df["time_index"].to_numpy(dtype=int)
-        torque_values = torque_compact_df[TORQUE_COL].to_numpy(dtype=float)
-        torque_in_mvc = (torque_time_index >= mvc_i0) & (torque_time_index <= mvc_i1)
+    # BEFORE torque
+    ax = axes[0, 0]
+    ax.plot(torque_time_index[torque_in_mvc], torque_values[torque_in_mvc], alpha=0.85)
+    for s, e in zip(starts, stops):
+        if s >= mvc_i0 and e <= mvc_i1:
+            ax.axvline(s, color="orange", linewidth=2)
+            ax.axvline(e, color="orange", linewidth=2)
+    ax.set_title("BEFORE (Step 5 raw) — MVC_REF torque + VC borders")
+    ax.set_ylabel("Torque")
 
-        # hard freq
-        freq_tag = "9760"
-        bia4_R_col = f"bia4_R_ohm__f_{freq_tag}Hz"
-        bia4_Xc_col = f"bia4_Xc_ohm__f_{freq_tag}Hz"
+    # BEFORE bia
+    ax = axes[1, 0]
+    ax.plot(x_raw, y_raw, linewidth=1.2, alpha=0.85)
+    ax.scatter(x_raw, y_raw, s=14, alpha=0.85)
+    for s, e in zip(starts, stops):
+        if s >= mvc_i0 and e <= mvc_i1:
+            ax.axvline(s, color="orange", linewidth=2)
+            ax.axvline(e, color="orange", linewidth=2)
+    ax.set_title("|Z| bia4 @ 9760 Hz — BEFORE")
+    ax.set_ylabel("|Z| (ohm)")
+    ax.set_xlabel("Master time_index")
 
-        for df_name, df in [("bia4_compact_df", bia4_compact_df), ("bia4_compact_aligned_df_out", bia4_compact_aligned_df_out)]:
-            assert "time_index" in df.columns, f"{df_name} missing time_index"
-            assert bia4_R_col in df.columns, f"{df_name} missing {bia4_R_col}"
-            assert bia4_Xc_col in df.columns, f"{df_name} missing {bia4_Xc_col}"
+    # AFTER torque
+    ax = axes[0, 1]
+    ax.plot(torque_time_index[torque_in_mvc], torque_values[torque_in_mvc], alpha=0.85)
+    for s, e in zip(starts, stops):
+        if s >= mvc_i0 and e <= mvc_i1:
+            ax.axvline(s, color="orange", linewidth=2)
+            ax.axvline(e, color="orange", linewidth=2)
+    ax.set_title("AFTER (Step 5b aligned) — MVC_REF torque + VC borders")
+    ax.set_ylabel("Torque")
 
-        # ---- extract BIA scatter in MVC_REF (raw) ----
-        bia4_raw_time_index = bia4_compact_df["time_index"].to_numpy(dtype=int)
-        bia4_raw_absZ = np.sqrt(
-            bia4_compact_df[bia4_R_col].to_numpy(dtype=float) ** 2
-            + bia4_compact_df[bia4_Xc_col].to_numpy(dtype=float) ** 2
-        )
-        raw_in_mvc = (bia4_raw_time_index >= mvc_i0) & (bia4_raw_time_index <= mvc_i1)
-        x_raw = bia4_raw_time_index[raw_in_mvc]
-        y_raw = bia4_raw_absZ[raw_in_mvc]
-        order = np.argsort(x_raw)
-        x_raw = x_raw[order]
-        y_raw = y_raw[order]
+    # AFTER bia
+    ax = axes[1, 1]
+    ax.plot(x_aln, y_aln, linewidth=1.2, alpha=0.85)
+    ax.scatter(x_aln, y_aln, s=14, alpha=0.85)
+    for s, e in zip(starts, stops):
+        if s >= mvc_i0 and e <= mvc_i1:
+            ax.axvline(s, color="orange", linewidth=2)
+            ax.axvline(e, color="orange", linewidth=2)
+    ax.set_title(f"|Z| bia4 @ 9760 Hz — AFTER{lag_txt}")
+    ax.set_ylabel("|Z| (ohm)")
+    ax.set_xlabel("Master time_index")
 
-        # ---- extract BIA scatter in MVC_REF (aligned) ----
-        bia4_aln_time_index = bia4_compact_aligned_df_out["time_index"].to_numpy(dtype=int)
-        bia4_aln_absZ = np.sqrt(
-            bia4_compact_aligned_df_out[bia4_R_col].to_numpy(dtype=float) ** 2
-            + bia4_compact_aligned_df_out[bia4_Xc_col].to_numpy(dtype=float) ** 2
-        )
-        aln_in_mvc = (bia4_aln_time_index >= mvc_i0) & (bia4_aln_time_index <= mvc_i1)
-        x_aln = bia4_aln_time_index[aln_in_mvc]
-        y_aln = bia4_aln_absZ[aln_in_mvc]
-        order = np.argsort(x_aln)
-        x_aln = x_aln[order]
-        y_aln = y_aln[order]
-
-        # lag text
-        lag_txt = ""
-        if len(bia_sync_report_df_out) >= 1 and "total_lag_s" in bia_sync_report_df_out.columns:
-            lag_txt = f" (lag {float(bia_sync_report_df_out.iloc[0]['total_lag_s']):+0.2f}s)"
-
-        # ---- plot: 2 columns (BEFORE vs AFTER), each torque + bia ----
-        fig, axes = plt.subplots(2, 2, figsize=(14, 7), sharex="col")
-
-        # BEFORE torque
-        ax = axes[0, 0]
-        ax.plot(torque_time_index[torque_in_mvc], torque_values[torque_in_mvc], alpha=0.85)
-        for s, e in zip(starts, stops):
-            if s >= mvc_i0 and e <= mvc_i1:
-                ax.axvline(s, color="orange", linewidth=2)
-                ax.axvline(e, color="orange", linewidth=2)
-        ax.set_title("BEFORE (Step 05 raw) — MVC_REF torque + VC borders")
-        ax.set_ylabel("Torque")
-
-        # BEFORE bia
-        ax = axes[1, 0]
-        ax.plot(x_raw, y_raw, linewidth=1.2, alpha=0.85)
-        ax.scatter(x_raw, y_raw, s=14, alpha=0.85)
-        for s, e in zip(starts, stops):
-            if s >= mvc_i0 and e <= mvc_i1:
-                ax.axvline(s, color="orange", linewidth=2)
-                ax.axvline(e, color="orange", linewidth=2)
-        ax.set_title("|Z| bia4 @ 9760 Hz — BEFORE")
-        ax.set_ylabel("|Z| (ohm)")
-        ax.set_xlabel("Master time_index")
-
-        # AFTER torque
-        ax = axes[0, 1]
-        ax.plot(torque_time_index[torque_in_mvc], torque_values[torque_in_mvc], alpha=0.85)
-        for s, e in zip(starts, stops):
-            if s >= mvc_i0 and e <= mvc_i1:
-                ax.axvline(s, color="orange", linewidth=2)
-                ax.axvline(e, color="orange", linewidth=2)
-        ax.set_title("AFTER (Step 06 aligned) — MVC_REF torque + VC borders")
-        ax.set_ylabel("Torque")
-
-        # AFTER bia
-        ax = axes[1, 1]
-        ax.plot(x_aln, y_aln, linewidth=1.2, alpha=0.85)
-        ax.scatter(x_aln, y_aln, s=14, alpha=0.85)
-        for s, e in zip(starts, stops):
-            if s >= mvc_i0 and e <= mvc_i1:
-                ax.axvline(s, color="orange", linewidth=2)
-                ax.axvline(e, color="orange", linewidth=2)
-        ax.set_title(f"|Z| bia4 @ 9760 Hz — AFTER{lag_txt}")
-        ax.set_ylabel("|Z| (ohm)")
-        ax.set_xlabel("Master time_index")
-
-        plt.tight_layout()
-        plt.show()
+    plt.tight_layout()
+    bia_sync_qc_fig_out = fig
+    plt.show()
 
 
-    # ----------------------------
-    # Disk writes (COMMIT only)
-    # ----------------------------
-    if bool(BIA_SYNC_COMMIT):
-        bia2_compact_aligned_df_out.to_parquet(P_BIA2_ALIGNED, index=False)
-        bia4_compact_aligned_df_out.to_parquet(P_BIA4_ALIGNED, index=False)
-        bia_sync_report_df_out.to_parquet(P_REPORT, index=False)
+

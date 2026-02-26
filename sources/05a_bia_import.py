@@ -20,9 +20,9 @@ assert "RAW_BIA_DIR" in globals(), "RAW_BIA_DIR missing (expected RAW_ROOT / 'bi
 assert isinstance(RAW_BIA_DIR, Path), "RAW_BIA_DIR must be a pathlib.Path"
 assert RAW_BIA_DIR.exists(), f"RAW_BIA_DIR does not exist: {RAW_BIA_DIR}"
 
-assert "CACHE_05_BIA_IMPORT" in globals(), "CACHE_05_BIA_IMPORT missing (Path to base parquet handle)"
-assert isinstance(CACHE_05_BIA_IMPORT, Path), "CACHE_05_BIA_IMPORT must be a pathlib.Path"
-CACHE_05_BIA_IMPORT.parent.mkdir(parents=True, exist_ok=True)
+assert "CACHE_05a_BIA_IMPORT" in globals(), "CACHE_05a_BIA_IMPORT missing (Path to base parquet handle)"
+assert isinstance(CACHE_05a_BIA_IMPORT, Path), "CACHE_05a_BIA_IMPORT must be a pathlib.Path"
+CACHE_05a_BIA_IMPORT.parent.mkdir(parents=True, exist_ok=True)
 
 assert "master_index_grid" in globals(), "master_index_grid missing"
 assert isinstance(master_index_grid, pd.DataFrame), "master_index_grid must be a pandas DataFrame"
@@ -56,21 +56,21 @@ bia4_pickle_path = RAW_BIA_DIR / f"{subject_key}_{experiment_date_yyyymmdd}_BIA_
 assert bia2_pickle_path.exists(), f"Missing BIA 2PT file: {bia2_pickle_path}"
 assert bia4_pickle_path.exists(), f"Missing BIA 4PT file: {bia4_pickle_path}"
 
-print(f"[05_bia_import] RUN_ID={RUN_ID}")
-print(f"[05_bia_import] ts_ref = {ts_ref}")
-print(f"[05_bia_import] RAW_BIA_DIR = {RAW_BIA_DIR}")
-print(f"[05_bia_import] Loading 2PT = {bia2_pickle_path.name}")
-print(f"[05_bia_import] Loading 4PT = {bia4_pickle_path.name}")
+print(f"[05a_bia_import] RUN_ID={RUN_ID}")
+print(f"[05a_bia_import] ts_ref = {ts_ref}")
+print(f"[05a_bia_import] RAW_BIA_DIR = {RAW_BIA_DIR}")
+print(f"[05a_bia_import] Loading 2PT = {bia2_pickle_path.name}")
+print(f"[05a_bia_import] Loading 4PT = {bia4_pickle_path.name}")
 
 
 # Cache paths derived from the single cache handle
 
-cache_parent_dir = CACHE_05_BIA_IMPORT.parent
+cache_parent_dir = CACHE_05a_BIA_IMPORT.parent
 
-cache_bia2_compact_path = cache_parent_dir / "05_bia2_compact.parquet"
-cache_bia4_compact_path = cache_parent_dir / "05_bia4_compact.parquet"
-cache_bia2_freqs_path   = cache_parent_dir / "05_bia2_freqs_hz.parquet"
-cache_bia4_freqs_path   = cache_parent_dir / "05_bia4_freqs_hz.parquet"
+cache_bia2_compact_path = cache_parent_dir / "05a_bia2_compact.parquet"
+cache_bia4_compact_path = cache_parent_dir / "05a_bia4_compact.parquet"
+cache_bia2_freqs_path   = cache_parent_dir / "05a_bia2_freqs_hz.parquet"
+cache_bia4_freqs_path   = cache_parent_dir / "05a_bia4_freqs_hz.parquet"
 
 
 cache_all_present = (
@@ -142,7 +142,7 @@ def build_bia_compact_table(prefix: str, sample_timestamps_dt: np.ndarray, frequ
     non_monotonic_indices = np.where(bia_time_deltas_seconds < 0)[0]
 
     print(
-        f"[05_bia_import] {prefix} monotonic check: n={bia_time_on_master_seconds.size} | "
+        f"[05a_bia_import] {prefix} monotonic check: n={bia_time_on_master_seconds.size} | "
         f"bad_count={int(non_monotonic_indices.size)} | "
         f"min_dt_s={float(np.min(bia_time_deltas_seconds)) if bia_time_deltas_seconds.size else np.nan}"
     )
@@ -151,9 +151,9 @@ def build_bia_compact_table(prefix: str, sample_timestamps_dt: np.ndarray, frequ
         first_bad_index = int(non_monotonic_indices[0])
         debug_slice = slice(max(0, first_bad_index - 3), min(bia_time_on_master_seconds.size, first_bad_index + 6))
 
-        print("[05_bia_import] first bad idx =", first_bad_index, "| dt_s =", float(bia_time_deltas_seconds[first_bad_index]))
-        print(f"[05_bia_import] {prefix}_time_on_master_s around bad:", bia_time_on_master_seconds[debug_slice])
-        print(f"[05_bia_import] {prefix} sample timestamps around bad:", sample_timestamps_series.to_numpy()[debug_slice])
+        print("[05a_bia_import] first bad idx =", first_bad_index, "| dt_s =", float(bia_time_deltas_seconds[first_bad_index]))
+        print(f"[05a_bia_import] {prefix}_time_on_master_s around bad:", bia_time_on_master_seconds[debug_slice])
+        print(f"[05a_bia_import] {prefix} sample timestamps around bad:", sample_timestamps_series.to_numpy()[debug_slice])
         raise ValueError(f"{prefix} time_on_master_seconds not monotonic (cannot map reliably).")
 
     mapped_time_index = map_times_to_master_time_index(bia_time_on_master_seconds, master_time_ref_seconds)
@@ -184,7 +184,7 @@ def build_bia_compact_table(prefix: str, sample_timestamps_dt: np.ndarray, frequ
 # Cache load (if present) else compute + write cache
 
 if cache_all_present:
-    print("[05_bia_import] cache hit -> loading parquet siblings")
+    print("[05a_bia_import] cache hit -> loading parquet siblings")
 
     bia2_compact_loaded = pd.read_parquet(cache_bia2_compact_path)
     bia4_compact_loaded = pd.read_parquet(cache_bia4_compact_path)
@@ -207,7 +207,7 @@ if cache_all_present:
     bia4_freqs_hz = bia4_freqs_loaded["freq_hz"].to_numpy(dtype=float)
 
 else:
-    print("[05_bia_import] cache miss -> computing and writing parquet siblings")
+    print("[05a_bia_import] cache miss -> computing and writing parquet siblings")
 
     bia2_sample_timestamps_dt, bia2_frequency_values_hz, bia2_impedance_complex_matrix = load_bia_pickle_full_spectrum(bia2_pickle_path)
     bia4_sample_timestamps_dt, bia4_frequency_values_hz, bia4_impedance_complex_matrix = load_bia_pickle_full_spectrum(bia4_pickle_path)
@@ -223,7 +223,7 @@ else:
     pd.DataFrame({"freq_hz": bia2_freqs_hz}).to_parquet(cache_bia2_freqs_path, index=False)
     pd.DataFrame({"freq_hz": bia4_freqs_hz}).to_parquet(cache_bia4_freqs_path, index=False)
 
-    print("[05_bia_import] wrote:")
+    print("[05a_bia_import] wrote:")
     print("  -", cache_bia2_compact_path.name)
     print("  -", cache_bia4_compact_path.name)
     print("  -", cache_bia2_freqs_path.name)

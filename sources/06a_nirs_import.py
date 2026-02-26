@@ -6,7 +6,7 @@
 # - Deterministic nearest mapping to master time_ref_s (like BIA)
 # - NO interpolation / NO fill / NO master padding
 # - Drop out-of-master-range samples (explicit, reported)
-# Cache: 07_nirs_compact.parquet + 07_nirs_import_report.parquet under CACHE_07_NIRS_IMPORT.parent
+# Cache: 07_nirs_compact.parquet under CACHE_07_NIRS_IMPORT.parent
 # ============================================================
 
 from pathlib import Path
@@ -24,8 +24,8 @@ assert "ts_ref" in globals() and isinstance(ts_ref, pd.Timestamp), "ts_ref missi
 assert "RAW_NIRS_DIR" in globals() and isinstance(RAW_NIRS_DIR, Path), "RAW_NIRS_DIR missing/invalid (expected RAW_ROOT / 'nirs')"
 assert RAW_NIRS_DIR.exists(), f"RAW_NIRS_DIR does not exist: {RAW_NIRS_DIR}"
 
-assert "CACHE_07_NIRS_IMPORT" in globals() and isinstance(CACHE_07_NIRS_IMPORT, Path), "CACHE_07_NIRS_IMPORT missing/invalid (Path base handle)"
-CACHE_07_NIRS_IMPORT.parent.mkdir(parents=True, exist_ok=True)
+assert "CACHE_06a_NIRS_IMPORT" in globals() and isinstance(CACHE_06a_NIRS_IMPORT, Path), "CACHE_06a_NIRS_IMPORT missing/invalid (Path base handle)"
+CACHE_06a_NIRS_IMPORT.parent.mkdir(parents=True, exist_ok=True)
 
 assert "master_index_grid" in globals() and isinstance(master_index_grid, pd.DataFrame), "master_index_grid missing/invalid"
 for required_master_col in ["time_ref_s", "SEQ_index", "VC", "VC_count"]:
@@ -56,16 +56,14 @@ NIRS_COL_NAMES = [
 nirs_txt_path = RAW_NIRS_DIR / f"{RUN_ID}_NIRS.txt"
 assert nirs_txt_path.exists(), f"NIRS file not found: {nirs_txt_path}"
 
-cache_compact_path = CACHE_07_NIRS_IMPORT.parent / "07_nirs_compact.parquet"
-cache_report_path = CACHE_07_NIRS_IMPORT.parent / "07_nirs_import_report.parquet"
+cache_compact_path = CACHE_06a_NIRS_IMPORT.parent / "06a_nirs_compact.parquet"
 
 # ----------------------------
 # Cache hit
 # ----------------------------
-if cache_compact_path.exists() and cache_report_path.exists():
+if cache_compact_path.exists() :
     nirs_compact_df_out = pd.read_parquet(cache_compact_path)
-    nirs_import_report_df_out = pd.read_parquet(cache_report_path)
-    print("[07_nirs_import] cache hit:", cache_compact_path.name)
+    print("[06a_nirs_import] cache hit:", cache_compact_path.name)
 
 else:
     # ----------------------------
@@ -222,36 +220,19 @@ else:
     ), "time_index out of master bounds after in-range filter"
 
     # ----------------------------
-    # Cache + report
+    # Cache 
     # ----------------------------
     nirs_compact_df_out = nirs_compact_inrange_df
-
-    nirs_import_report_df_out = pd.DataFrame([{
-        "RUN_ID": RUN_ID,
-        "nirs_txt": nirs_txt_path.name,
-        "fs_nirs_hz": float(FS_NIRS_HZ),
-        "trim_head_s": float(NIRS_TRIM_HEAD_S),
-        "start_of_measurement": str(start_dt),
-        "n_raw_rows": int(len(nirs_compact_raw_df)),
-        "n_kept_rows": int(len(nirs_compact_inrange_df)),
-        "drop_low_import": drop_low,
-        "drop_high_import": drop_high,
-        "n_short_lines_dropped": int(short_line_count),
-        "master_time_ref_s_min": float(master_time_ref_s[0]),
-        "master_time_ref_s_max": float(master_time_ref_s[-1]),
-        "nirs_time_on_master_s_min": float(np.min(nirs_time_on_master_s_inrange)) if len(nirs_time_on_master_s_inrange) else np.nan,
-        "nirs_time_on_master_s_max": float(np.max(nirs_time_on_master_s_inrange)) if len(nirs_time_on_master_s_inrange) else np.nan,
-    }])
-
     nirs_compact_df_out.to_parquet(cache_compact_path, index=False)
-    nirs_import_report_df_out.to_parquet(cache_report_path, index=False)
 
-    print("[07_nirs_import] wrote:")
+    print("[06a_nirs_import] wrote:")
     print("  -", cache_compact_path.name)
-    print("  -", cache_report_path.name)
 
-# Optional dict-style output 
+
+
+
+# dict-style output 
 nirs_tables_out = {
     "nirs_compact_df": nirs_compact_df_out,
-    "nirs_import_report_df": nirs_import_report_df_out,
 }
+

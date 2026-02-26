@@ -47,12 +47,25 @@ time_ref_s = master_index_grid["time_ref_s"].to_numpy(dtype=float)
 seq_index = np.searchsorted(picked_times_s, time_ref_s, side="right").astype(int)
 
 seq_names = np.array(SEQ_ORDER, dtype=object)
+# adds the sequence labels to the master_index_grid, emg_compact_df, and torque_compact_df
 master_index_grid["SEQ_index"] = seq_index
 master_index_grid["SEQ"] = seq_names[seq_index]
 
+# map via time_index to apply the same SEQ labels to the emg_compact_df and torque_compact_df (which don't have the same number of rows, for space/ram/speed constraint)
+emg_time_index = emg_compact_df["time_index"].to_numpy(dtype=int) # used for lookup
+torque_time_index = torque_compact_df["time_index"].to_numpy(dtype=int) # used for lookup
+
+emg_compact_df["SEQ_index"] = master_index_grid["SEQ_index"].to_numpy()[emg_time_index] #
+emg_compact_df["SEQ"] = master_index_grid["SEQ"].to_numpy()[emg_time_index]
+
+torque_compact_df["SEQ_index"] = master_index_grid["SEQ_index"].to_numpy()[torque_time_index]
+torque_compact_df["SEQ"] = master_index_grid["SEQ"].to_numpy()[torque_time_index]
+
+
+
 # print
-unique_seq = list(master_index_grid["SEQ"].unique())
+unique_seq = list(master_index_grid["SEQ"].unique()) #only for this df, it's the same for the other 2 anyway.
 print("SEQ labels present:", unique_seq)
 print("Applied boundaries:", len(picked_times_s), "Expected:", expected_n_bounds)
 
-del time_ref_s, seq_index, seq_names, picked_times_s
+

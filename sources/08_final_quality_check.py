@@ -21,15 +21,27 @@ assert "CACHE_DIR" in globals(), "CACHE_DIR missing"
 assert isinstance(CACHE_DIR, Path), "CACHE_DIR must be a pathlib.Path"
 
 assert "master_index_grid" in globals(), "master_index_grid missing"
-assert "bia2_compact_aligned_df" in globals(), "bia2_compact_aligned_df missing"
-assert "bia4_compact_aligned_df" in globals(), "bia4_compact_aligned_df missing"
-assert "nirs_compact_aligned_df" in globals(), "nirs_compact_aligned_df missing"
-assert "myoton_compact_df" in globals(), "myoton_compact_df missing"
+# assert "bia2_compact_aligned_df" in globals(), "bia2_compact_aligned_df missing"
+# assert "bia4_compact_aligned_df" in globals(), "bia4_compact_aligned_df missing"
+# assert "nirs_compact_aligned_df" in globals(), "nirs_compact_aligned_df missing"
+# assert "myoton_compact_df" in globals(), "myoton_compact_df missing"
 
 master_index_grid = master_index_grid
-bia2_compact_aligned_df = bia2_compact_aligned_df
-bia4_compact_aligned_df = bia4_compact_aligned_df
+
+#bia from alignment steps (already aligned to master, no recompute here)
+bia2_path_cache = CACHE_DIR / "05b_bia2_compact_aligned.parquet"
+bia4_freqs_cache_path = CACHE_DIR / "05b_bia4_compact_aligned.parquet"
+bia2_compact_aligned_df = pd.read_parquet(bia2_path_cache)
+bia4_compact_aligned_df = pd.read_parquet(bia4_freqs_cache_path)
+
+# bia2_compact_aligned_df = bia2_compact_aligned_df
+# bia4_compact_aligned_df = bia4_compact_aligned_df
 nirs_compact_aligned_df = nirs_compact_aligned_df
+
+
+#myoton load
+myoton_path_cache = CACHE_07_MYOTON
+myoton_compact_df = pd.read_parquet(myoton_path_cache)
 myoton_compact_df = myoton_compact_df
 
 
@@ -50,8 +62,10 @@ assert "row_type" in myoton_compact_df.columns, "myoton_compact_df must contain 
 # ----------------------------
 # CACHED FILE INPUTS (EMG / TORQUE)
 # ----------------------------
-emg_cache_path = CACHE_DIR / "02_emg.parquet"
-torque_cache_path = CACHE_DIR / "02_torque_import.parquet"
+# emg_cache_path = CACHE_DIR / "02_emg_compact.parquet"
+emg_cache_path = CACHE_02_EMG
+torque_cache_path = CACHE_02_TORQUE
+# torque_cache_path = CACHE_DIR / "02_torque_compact.parquet"
 
 assert emg_cache_path.exists(), f"Missing EMG cache: {emg_cache_path}"
 assert torque_cache_path.exists(), f"Missing torque cache: {torque_cache_path}"
@@ -59,13 +73,13 @@ assert torque_cache_path.exists(), f"Missing torque cache: {torque_cache_path}"
 emg_compact_df = pd.read_parquet(emg_cache_path)
 torque_compact_df = pd.read_parquet(torque_cache_path)
 
-assert "time_index" in emg_compact_df.columns, "02_emg.parquet must contain time_index"
+assert "time_index" in emg_compact_df.columns, "02_emg_compact.parquet must contain time_index"
 required_emg_channels = ["emg10", "emg6", "emg8"]
 for emg_channel_col in required_emg_channels:
-    assert emg_channel_col in emg_compact_df.columns, f"02_emg.parquet missing required EMG channel: {emg_channel_col}"
+    assert emg_channel_col in emg_compact_df.columns, f"02_emg_compact.parquet missing required EMG channel: {emg_channel_col}"
 
-assert "time_index" in torque_compact_df.columns, "02_torque_import.parquet must contain time_index"
-assert "torque_raw" in torque_compact_df.columns, "02_torque_import.parquet missing torque_raw"
+assert "time_index" in torque_compact_df.columns, "02_torque_compact.parquet must contain time_index"
+assert "torque_raw" in torque_compact_df.columns, "02_torque_compact.parquet missing torque_raw"
 
 
 # ----------------------------
@@ -213,7 +227,7 @@ assert isinstance(seq_box_list, list), "seq_box_list must be a list"
 # ----------------------------
 # PREP — BIA4 sweep freqs + SEQ name -> SEQ_index mapping
 # ----------------------------
-bia4_freqs_cache_path = CACHE_DIR / "05_bia4_freqs_hz.parquet"
+bia4_freqs_cache_path = CACHE_DIR / "05a_bia4_freqs_hz.parquet"
 assert bia4_freqs_cache_path.exists(), f"Missing BIA4 freqs cache: {bia4_freqs_cache_path}"
 
 bia4_freqs_df = pd.read_parquet(bia4_freqs_cache_path)
@@ -786,7 +800,6 @@ qc_figs.append((figC_nyq, "C__BIA4_Nyquist_panels"))
 
 
 #region FIG D - NIRS by Tx (overview, active sequence shaded)
-
 # explicit decimation knob for NIRS overview
 NIRS_OVERVIEW_DECIMATE_EVERY = 1
 assert isinstance(NIRS_OVERVIEW_DECIMATE_EVERY, int) and NIRS_OVERVIEW_DECIMATE_EVERY >= 1
