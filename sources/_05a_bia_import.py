@@ -55,6 +55,7 @@ def run_bia_import(
     assert np.all(np.diff(master_time_ref_seconds) > 0)
 
     master_seq_index = master_index_grid["SEQ_index"].to_numpy(dtype=int)
+    master_seq = master_index_grid["SEQ"].to_numpy(dtype=object)
     master_vc = master_index_grid["VC"].to_numpy(dtype=int)
     master_vc_count = master_index_grid["VC_count"].to_numpy(dtype=int)
 
@@ -163,6 +164,7 @@ def run_bia_import(
         df = pd.DataFrame({
             "time_index": mapped_idx,
             "SEQ_index": master_seq_index[mapped_idx],
+            "SEQ": master_seq[mapped_idx],
             "VC": master_vc[mapped_idx],
             "VC_count": master_vc_count[mapped_idx],
             f"{prefix}_time_on_master_s": time_s,

@@ -1,0 +1,1131 @@
+---
+title: "EMG Fatigue Analysis Pipeline"
+author: "Morgan Virolan"
+date: "2026-02-20"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+
+
+---
+
+# Scientific question and Objectives
+This is the companion notebook for the AMSTROM Campain, where we analyze the sEMG and torque data from the fatigue protocol. It's main objectives is (at this point) to quntifify the fatigue-induced changes in sEMG features (RMS, MDF) during the dynamic (EX_DYN) and static (EX_STA) fatigue sequences, and to see how they relate to the torque loss.
+It's the first step of the broader study which will also include the analysis of other physiological signals recorded during the same experimental protocole (BIA, NIRS, Mecanical values) + stats & ML.
+
+Dataset structure
+Signal assumptions (delsys hardware band-pass ?? "slow" ramp up -> cut middle sequence + fist windows on STA)
+
+# Data and Preprocessing Framework
+```{r setup, message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(signal)   # butter(), filtfilt()
+library(glue)
+
+
+options(dplyr.summarise.inform = FALSE)
+```
+
+```{r load_data}
+RUN_ID <- "101SaCl_20251127"
+subject_directory <- "results/DATA_EXPORT" |> 
+  file.path(RUN_ID) |>
+  glue::glue()
+
+library(arrow)
+library(dplyr)
+
+master_file_path <- file.path(subject_directory, "02_master.parquet")
+emg_file_path    <- file.path(subject_directory, "02_emg_compact.parquet")
+torque_file_path <- file.path(subject_directory, "02_torque_compact.parquet")
+
+master_table <- read_parquet(master_file_path)
+emg_table    <- read_parquet(emg_file_path)
+torque_table <- read_parquet(torque_file_path)
+
+analysis_table <- master_table |>
+  inner_join(
+    emg_table |> select(-VC, -VC_count, -SEQ, -SEQ_index),
+    by = "time_index"
+  ) |>
+  left_join(
+    torque_table |> select(-VC, -VC_count, -SEQ, -SEQ_index),
+    by = "time_index"
+  )
+
+cat("nrow(master_table):", nrow(master_table), "\n")
+cat("nrow(emg_table):   ", nrow(emg_table), "\n")
+cat("nrow(torque_table):", nrow(torque_table), "\n")
+cat("nrow(analysis_table):", nrow(analysis_table), "\n")
+
+## master & emg must share the same hz, torque is expected to be about 1/5 of that and do contain n/a
+analysis_table %>%
+  summarise(
+    duration_s = max(time_ref_s) - min(time_ref_s),
+    fs_est_hz = n() / duration_s,
+    torque_na_frac = mean(is.na(torque_raw))
+  )
+```
+
+
+
+
+```{r mvc_svc_load}
+# MVC_REF = 3 to 4 reps of maximal voluntary contraction (MVC) at the start of the session
+mvc_ref_table <- analysis_table |>
+  dplyr::filter(.data[["SEQ"]] == "MVC_REF",
+              .data[["VC"]] == 1) |> # only keep actual reps (voluntary contraction = 1) / no rest
+  dplyr::arrange(.data[["time_index"]])
+
+
+#SVC_REF = submaximal voluntary contractions at 30/50/70% of MVC, used for calibration of torque and EMG
+svc_ref_table <- analysis_table |>
+  dplyr::filter(.data[["SEQ"]] == "SVC_REF",
+              .data[["VC"]] == 1) |> 
+  dplyr::arrange(.data[["time_index"]])
+
+
+#MVC_RECOV_DYN = MVC checkup after the dynamic fatigue sequence (EX_DYN) + 5 mins rest -  used to assess recovery oafter fatigue
+
+mvc_recov_dyn_table <- analysis_table |>
+  dplyr::filter(.data[["SEQ"]] == "MVC_RECOV_DYN",
+              .data[["VC"]] == 1) |> 
+  dplyr::arrange(.data[["time_index"]])
+
+
+#MVC_RECOV_STA = MVC checkup after the static fatigue sequence (EX_STA) + 5 mins rest -  used to assess recovery after fatigue
+
+mvc_recov_sta_table <- analysis_table |>
+  dplyr::filter(.data[["SEQ"]] == "MVC_RECOV_STA",
+              .data[["VC"]] == 1) |> 
+  dplyr::arrange(.data[["time_index"]])
+
+```
+
+
+```{r ex_dyn_ex_sta_load}
+## EX_DYN = dynamic fatigue sequence (62 reps, 3s efforts 2s recup, max effort each rep)
+ex_dyn_table <- analysis_table |>
+  dplyr::filter(.data[["SEQ"]] == "EX_DYN",
+                .data[["VC"]] == 1) |>
+  dplyr::arrange(.data[["time_index"]])
+
+## EX_STA = static fatigue sequence (1 rep, 60s effort, 70% of baseline mvc)
+ex_sta_table <- analysis_table |>
+  dplyr::filter(.data[["SEQ"]] == "EX_STA",
+                .data[["VC"]] == 1) |> #just in case sequencing is loose (everything should be VC==1)
+  dplyr::arrange(.data[["time_index"]])
+
+```
+## Dataset Structure
+
+## Torque Calibration
+```{r torque_calibration}
+#set values, from the biodex calibration
+torque_offset_volt <- 0.106
+torque_gain_Nm_per_volt <- 145.30
+
+calc_torque_nm <- function(df) {
+  df %>% dplyr::mutate(torque_Nm = torque_gain_Nm_per_volt * (torque_raw - torque_offset_volt))
+}
+
+ex_dyn_table       <- calc_torque_nm(ex_dyn_table)
+ex_sta_table       <- calc_torque_nm(ex_sta_table)
+mvc_ref_table      <- calc_torque_nm(mvc_ref_table)
+svc_ref_table      <- calc_torque_nm(svc_ref_table)
+mvc_recov_dyn_table <- calc_torque_nm(mvc_recov_dyn_table)
+mvc_recov_sta_table <- calc_torque_nm(mvc_recov_sta_table)
+
+#print the 10 lines of each + 10 lines of the raw table to see the difference
+print(head(ex_dyn_table |> dplyr::select(time_ref_s, torque_raw, torque_Nm), 10))
+
+```
+
+CLEANUP
+
+```{r cleanup_raw_torque}
+#cleanup raw torque (keep only the calibrated torque in Nm to save memory)
+# ex_dyn_table <- ex_dyn_table |> dplyr::select(-torque_raw)
+# ex_sta_table <- ex_sta_table |> dplyr::select(-torque_raw)
+# mvc_ref_table <- mvc_ref_table |> dplyr::select(-torque_raw)
+# svc_ref_table <- svc_ref_table |> dplyr::select(-torque_raw)
+# mvc_recov_dyn_table <- mvc_recov_dyn_table |> dplyr::select(-torque_raw)
+# mvc_recov_sta_table <- mvc_recov_sta_table |> dplyr::select(-torque_raw)
+
+print(head(ex_dyn_table, 10))                                           
+
+```
+```{r cleanup_analysis_table}
+#remove the analysis table  - we extracted what we need for now
+rm(analysis_table)
+rm(emg_table)
+rm(torque_table)
+gc()
+```
+
+## Signal Processing 
+
+```{r EMG_filtering}
+# CONSTANTS
+emg_sampling_frequency_hz <- 2148.149
+
+emg_bandpass_low_hz <- 20
+emg_bandpass_high_hz <- 450
+emg_filter_order <- 4
+
+
+# BANDPASS FILTER FUNCTION -----------------------------------
+# clean artefacts, movement related noises, high freq noise.
+emg_bandpass_filter <- function(emg_signal, sampling_frequency_hz, 
+                                low_hz, high_hz, filter_order) {
+  
+  # Centers signal around zero by subtracting the mean.
+  # This prevents a large "spike" at 0Hz in the frequency domain (dc offset removal)
+  emg_centered <- emg_signal - mean(emg_signal, na.rm = TRUE)
+  
+  # Nyquist Normalization : cutoffs needed for digital filters
+  # ratio of the Nyquist frequency (half the sampling rate).
+  normalized_cutoffs <- c(low_hz, high_hz) / (sampling_frequency_hz / 2)
+  
+  # Butterworth filter 
+  butter_filter <- signal::butter(filter_order, normalized_cutoffs, type = "pass")
+  
+  # Zero-Phase Filtering
+  # filter twice (forward and backward) -> no time-shift (phase lag
+  signal::filtfilt(butter_filter, emg_centered)
+}
+
+
+```
+
+
+# Definition of the Analysis Window
+
+Adds markdown later to justify windows (comparable, avoid artefacts dues to ramps, enough hz to still run everything, etc)
+
+## Contraction Labels
+
+
+## Middle 1 s Window Extraction
+
+```{r extract_middle_1s_window_function}
+extract_middle_1s_window <- function(rep_df, window_length_s = 1.0) {
+
+  rep_df |>
+    dplyr::group_by(.data$VC_count) |>
+    dplyr::mutate(
+      t_mid = (min(.data$time_ref_s) + max(.data$time_ref_s)) / 2,
+      mid_start = .data$t_mid - window_length_s / 2,
+      mid_end   = .data$t_mid + window_length_s / 2
+    ) |>
+    dplyr::filter(
+      .data$time_ref_s >= mid_start,
+      .data$time_ref_s < mid_end
+    ) |>
+    dplyr::select(-.data$t_mid, -.data$mid_start, -.data$mid_end) |>
+    dplyr::ungroup()
+}
+```
+
+```{r build_1s_table}
+#mvc_ref
+mvc_ref_mid1s_table <- extract_middle_1s_window(mvc_ref_table)
+
+mvc_ref_mid1s_table |>
+  dplyr::group_by(VC_count) |>
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    duration_s = max(time_ref_s) - min(time_ref_s),
+    fs_est = n_rows / duration_s,
+    .groups = "drop"
+  )
+
+#svc_ref
+svc_ref_mid1s_table <- extract_middle_1s_window(svc_ref_table)
+
+svc_ref_mid1s_table |>
+  dplyr::group_by(VC_count) |>
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    duration_s = max(time_ref_s) - min(time_ref_s),
+    fs_est = n_rows / duration_s,
+    .groups = "drop"
+  )
+
+#mvc_recov_dyn
+mvc_recov_dyn_mid1s_table <- extract_middle_1s_window(mvc_recov_dyn_table)
+
+mvc_recov_dyn_mid1s_table |>
+  dplyr::group_by(VC_count) |>
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    duration_s = max(time_ref_s) - min(time_ref_s),
+    fs_est = n_rows / duration_s,
+    .groups = "drop"
+  )
+
+#mvc_recov_sta
+mvc_recov_sta_mid1s_table <- extract_middle_1s_window(mvc_recov_sta_table)
+
+mvc_recov_sta_mid1s_table |>
+  dplyr::group_by(VC_count) |>
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    duration_s = max(time_ref_s) - min(time_ref_s),
+    fs_est = n_rows / duration_s,
+    .groups = "drop"
+  )
+
+#ex_dyn
+ex_dyn_mid1s_table <- extract_middle_1s_window(ex_dyn_table)
+
+ex_dyn_mid1s_table |>
+  dplyr::group_by(VC_count) |>
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    duration_s = max(time_ref_s) - min(time_ref_s),
+    fs_est = n_rows / duration_s,
+    .groups = "drop"
+  )
+
+```
+
+
+
+```{r extract_ex_sta_middle_1s_window}
+# EX_STA window grid (1 s, non-overlap)
+
+window_length_s <- 1.0 #must match
+window_step_s   <- 1.0
+
+t_start <- min(ex_sta_table$time_ref_s)
+t_end   <- max(ex_sta_table$time_ref_s)
+
+window_start_s <- seq(t_start, t_end - window_length_s, by = window_step_s)
+
+ex_sta_window_table <- tibble::tibble(
+  window_id      = seq_along(window_start_s),
+  window_start_s = window_start_s,
+  window_end_s   = window_start_s + window_length_s,
+  window_mid_s   = window_start_s + window_length_s / 2
+)
+
+nrow(ex_sta_window_table)
+ex_sta_window_table |> dplyr::slice(1:5)
+
+## attach data
+
+ex_sta_mid1s_table <- ex_sta_table |>
+  dplyr::mutate(
+    window_id = floor((time_ref_s - t_start) / window_step_s) + 1L
+  ) |>
+  dplyr::filter(
+    window_id >= 1L,
+    window_id <= nrow(ex_sta_window_table)
+  ) |>
+  dplyr::left_join(
+    ex_sta_window_table,
+    by = "window_id"
+  ) |>
+  dplyr::select(
+    time_index, time_ref_s, SEQ_index, SEQ, VC, VC_count,
+    window_id, window_start_s, window_end_s, window_mid_s,
+    emg6, emg8, emg10, torque_raw, torque_Nm
+  )
+
+# quick check: should show ~1.0 s duration per window
+ex_sta_mid1s_table |>
+  dplyr::group_by(window_id) |>
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    duration_s = max(time_ref_s) - min(time_ref_s),
+    .groups = "drop"
+  ) |>
+  dplyr::slice(1:10) |>
+  print()
+```
+
+# Feature Extraction
+
+Markdown explications + features etc. 
+All EMG features are computed on previously defined 1 s windows.
+
+
+## EMG Amplitude Descriptor (RMS)
+
+
+
+```{r RMS_function}
+# RMS FUNCTION -----------------------------------
+# Squares every point (-> everything becomes positive), finds average, takes the root -> power of the signal (same unit). amplitude/intensity of the contraction.
+emg_rms <- function(emg_signal) {
+  sqrt(mean(emg_signal^2, na.rm = TRUE))
+}
+```
+
+
+## EMG Spectral Descriptor (Median Frequency)
+
+markdown explications 
+
+```{r MDF_function}
+# MDF
+
+emg_median_frequency_hz <- function(emg_signal, sampling_frequency_hz) {
+  emg_centered <- emg_signal - mean(emg_signal) #recompute, last one is nested and global var is a dangerous world.
+  n_samples <- length(emg_centered)
+# Hann window to reduce spectral leakage 
+  hann_window <- 0.5 - 0.5 * cos(2 * pi * (0:(n_samples - 1)) / (n_samples - 1))
+  emg_windowed <- emg_centered * hann_window
+
+# Single-sided power spectrum (FFT)
+  fft_complex <- stats::fft(emg_windowed)
+  n_half <- floor(n_samples / 2) + 1
+  fft_half <- fft_complex[1:n_half]
+  
+# Power spectrum (magnitude squared of the FFT, normalized by the number of samples)
+  power_spectrum <- (Mod(fft_half) ^ 2) / n_samples
+  frequency_axis_hz <- (0:(n_half - 1)) * (sampling_frequency_hz / n_samples)
+  
+  #drop 0hz bin
+  power_spectrum <- power_spectrum[-1]
+frequency_axis_hz <- frequency_axis_hz[-1]
+
+  # Cumulative power to find the median frequency
+  cumulative_power <- cumsum(power_spectrum)
+  median_index <- which(cumulative_power >= 0.5 * sum(power_spectrum))[1]
+  
+  frequency_axis_hz[median_index]
+  }
+```
+
+
+# Construction of Feature Tables
+
+
+
+
+## MVC Reference Features
+
+```{r compute_feature_mvc_ref_mid1s_ref_table}
+channels <- c("emg6", "emg8", "emg10")
+
+mvc_ref_split <- split(mvc_ref_mid1s_table, mvc_ref_mid1s_table$VC_count)
+
+mvc_ref_mid1s_feature_table <- dplyr::bind_rows(lapply(names(mvc_ref_split), function(vc_id) {
+
+  block <- mvc_ref_split[[vc_id]]
+
+  torque_mean_Nm <- mean(block$torque_Nm, na.rm = TRUE)
+
+  dplyr::bind_rows(lapply(channels, function(ch) {
+
+    x <- block[[ch]]
+
+    dplyr::tibble(
+      SEQ = "MVC_REF",
+      VC_count = as.integer(vc_id),
+      channel = ch,
+      rms_mid_1s = emg_rms(x),
+      mdf_mid_1s_hz = emg_median_frequency_hz(x, emg_sampling_frequency_hz),
+      torque_mean_Nm = torque_mean_Nm,
+      n_samples = sum(is.finite(x))
+    )
+  }))
+})) |>
+  dplyr::arrange(channel, VC_count)
+
+print(mvc_ref_mid1s_feature_table)
+```
+
+```{r compute_feature_svc_ref_mid1s_table}
+
+channels <- c("emg6", "emg8", "emg10")
+
+svc_ref_split <- split(svc_ref_mid1s_table, svc_ref_mid1s_table$VC_count)
+
+svc_ref_mid1s_feature_table <- dplyr::bind_rows(lapply(names(svc_ref_split), function(vc_id) {
+
+  block <- svc_ref_split[[vc_id]]
+  torque_mean_Nm <- mean(block$torque_Nm, na.rm = TRUE)
+
+  dplyr::bind_rows(lapply(channels, function(ch) {
+
+    x <- block[[ch]]
+
+    dplyr::tibble(
+      SEQ = "SVC_REF",
+      VC_count = as.integer(vc_id),
+      channel = ch,
+      rms_mid_1s = emg_rms(x),
+      mdf_mid_1s_hz = emg_median_frequency_hz(x, emg_sampling_frequency_hz),
+      torque_mean_Nm = torque_mean_Nm,
+      n_samples = sum(is.finite(x))
+    )
+  }))
+})) |>
+  dplyr::arrange(channel, VC_count)
+
+print(svc_ref_mid1s_feature_table)
+svc_ref_mid1s_feature_table |> dplyr::count(channel) |> print()
+```
+
+```{r compute_feature_mvc_recov_dyn_mid1s_table}
+mvc_recov_dyn_split <- split(mvc_recov_dyn_mid1s_table, mvc_recov_dyn_mid1s_table$VC_count)
+
+mvc_recov_dyn_mid1s_feature_table <- dplyr::bind_rows(lapply(names(mvc_recov_dyn_split), function(vc_id) {
+
+  block <- mvc_recov_dyn_split[[vc_id]]
+  torque_mean_Nm <- mean(block$torque_Nm, na.rm = TRUE)
+
+  dplyr::bind_rows(lapply(channels, function(ch) {
+
+    x <- block[[ch]]
+
+    dplyr::tibble(
+      SEQ = "MVC_RECOV_DYN",
+      VC_count = as.integer(vc_id),
+      channel = ch,
+      rms_mid_1s = emg_rms(x),
+      mdf_mid_1s_hz = emg_median_frequency_hz(x, emg_sampling_frequency_hz),
+      torque_mean_Nm = torque_mean_Nm,
+      n_samples = sum(is.finite(x))
+    )
+  }))
+})) |>
+  dplyr::arrange(channel, VC_count)
+
+print(mvc_recov_dyn_mid1s_feature_table)
+```
+
+```{r compute_feature_mvc_recov_sta_mid1s_table}
+mvc_recov_sta_split <- split(mvc_recov_sta_mid1s_table, mvc_recov_sta_mid1s_table$VC_count)
+
+mvc_recov_sta_mid1s_feature_table <- dplyr::bind_rows(lapply(names(mvc_recov_sta_split), function(vc_id) {
+
+  block <- mvc_recov_sta_split[[vc_id]]
+  torque_mean_Nm <- mean(block$torque_Nm, na.rm = TRUE)
+
+  dplyr::bind_rows(lapply(channels, function(ch) {
+
+    x <- block[[ch]]
+
+    dplyr::tibble(
+      SEQ = "MVC_RECOV_STA",
+      VC_count = as.integer(vc_id),
+      channel = ch,
+      rms_mid_1s = emg_rms(x),
+      mdf_mid_1s_hz = emg_median_frequency_hz(x, emg_sampling_frequency_hz),
+      torque_mean_Nm = torque_mean_Nm,
+      n_samples = sum(is.finite(x))
+    )
+  }))
+})) |>
+  dplyr::arrange(channel, VC_count)
+
+print(mvc_recov_sta_mid1s_feature_table)
+```
+
+```{r combine_feature_mid1s_tables}
+
+reference_mid1s_feature_table <- dplyr::bind_rows(
+  mvc_ref_mid1s_feature_table,
+  svc_ref_mid1s_feature_table,
+  mvc_recov_dyn_mid1s_feature_table,
+  mvc_recov_sta_mid1s_feature_table
+) |>
+  dplyr::arrange(SEQ, channel, VC_count)
+
+print(reference_mid1s_feature_table)
+```
+
+```{r mvc_level_summary}
+mvc_level_summary <- reference_mid1s_feature_table |>
+  dplyr::filter(SEQ %in% c("MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA")) |>
+  dplyr::group_by(SEQ, channel) |>
+  dplyr::summarise(
+    n_reps = dplyr::n(),
+    torque_mean_Nm = mean(torque_mean_Nm, na.rm = TRUE),
+    rms_mid_1s_mean = mean(rms_mid_1s, na.rm = TRUE),
+    mdf_mid_1s_hz_mean = mean(mdf_mid_1s_hz, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+mvc_level_summary
+
+###mvc_ref_baseline <- mvc_level_summary |>
+mvc_ref_baseline <- mvc_level_summary |>
+  dplyr::filter(SEQ == "MVC_REF") |>
+  dplyr::select(
+    channel,
+    torque_ref_Nm = torque_mean_Nm,
+    rms_ref = rms_mid_1s_mean,
+    mdf_ref_hz = mdf_mid_1s_hz_mean
+  )
+
+mvc_ref_baseline
+```
+
+
+## EX_DYN Feature Table
+
+feature table per rep per channel
+
+```{r build_ex_dyn_1mids_feature_table}
+
+channels <- c("emg6", "emg8", "emg10")
+
+ex_dyn_split <- split(ex_dyn_mid1s_table, ex_dyn_mid1s_table$VC_count)
+
+ex_dyn_mid1s_feature_table <- dplyr::bind_rows(lapply(names(ex_dyn_split), function(vc_id) {
+
+  block <- ex_dyn_split[[vc_id]]
+  torque_mean_Nm <- mean(block$torque_Nm, na.rm = TRUE)
+
+  dplyr::bind_rows(lapply(channels, function(ch) {
+
+    x <- block[[ch]]
+
+    dplyr::tibble(
+      SEQ = "EX_DYN",
+      VC_count = as.integer(vc_id),
+      channel = ch,
+      rms_mid_1s = emg_rms(x),
+      mdf_mid_1s_hz = emg_median_frequency_hz(x, emg_sampling_frequency_hz),
+      torque_mean_Nm = torque_mean_Nm,
+      n_samples = sum(is.finite(x))
+    )
+  }))
+})) |>
+  dplyr::arrange(channel, VC_count)
+
+```
+
+
+## EX_STA Feature Table
+
+```{r compute_feature_ex_sta_mid1s_table}
+
+channels <- c("emg6", "emg8", "emg10")
+
+ex_sta_split <- split(ex_sta_mid1s_table, ex_sta_mid1s_table$window_id)
+
+ex_sta_mid1s_feature_table <- dplyr::bind_rows(lapply(names(ex_sta_split), function(win_id) {
+
+  block <- ex_sta_split[[win_id]]
+  torque_mean_Nm <- mean(block$torque_Nm, na.rm = TRUE)
+
+  dplyr::bind_rows(lapply(channels, function(ch) {
+
+    x <- block[[ch]]
+
+    dplyr::tibble(
+      SEQ = "EX_STA",
+      window_id = as.integer(win_id),
+      channel = ch,
+      rms_mid_1s = emg_rms(x),
+      mdf_mid_1s_hz = emg_median_frequency_hz(x, emg_sampling_frequency_hz),
+      torque_mean_Nm = torque_mean_Nm,
+      n_samples = sum(is.finite(x))
+    )
+  }))
+})) |>
+  dplyr::arrange(channel, window_id)
+
+print(ex_sta_mid1s_feature_table)
+
+
+```
+
+
+# Baseline Normalization
+
+
+## MVC Baseline Computation
+```{r compute_mvc_ref_mid1s_rms_baseline_table}
+mvc_ref_mid1s_rms_baseline_table <- mvc_ref_mid1s_feature_table |>
+  dplyr::group_by(channel) |>
+  dplyr::summarise(
+    rms_mvc_ref_mid1s_baseline = mean(rms_mid_1s, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(channel)
+
+print(mvc_ref_mid1s_rms_baseline_table)
+```
+
+```{r mvc_torque_plot_summary}
+mvc_torque_plot_df <- mvc_level_summary |>
+  dplyr::distinct(SEQ, torque_mean_Nm) |>
+  dplyr::mutate(
+    SEQ = factor(SEQ, levels = c("MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA"))
+  )
+
+ggplot(mvc_torque_plot_df, aes(x = SEQ, y = torque_mean_Nm)) +
+  geom_point(size = 3) +
+  geom_line(aes(group = 1)) +
+  labs(
+    title = "MVC — Torque baseline vs recovery",
+    x = NULL,
+    y = "Torque (Nm)"
+  )
+```
+
+```{r mvc_recov_plot_summary}
+mvc_rms_plot_df <- mvc_level_summary |>
+  dplyr::mutate(
+    SEQ = factor(SEQ, levels = c("MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA"))
+  )
+
+ggplot(mvc_rms_plot_df, aes(x = SEQ, y = rms_mid_1s_mean)) +
+  geom_point(size = 2) +
+  geom_line(aes(group = channel)) +
+  facet_wrap(~ channel, scales = "free_y") +
+  labs(
+    title = "MVC — RMS baseline vs recovery (middle 1s)",
+    x = NULL,
+    y = "RMS (a.u.)"
+  )
+```
+
+```{r mvc_mdf_plot_summary}
+mvc_mdf_plot_df <- mvc_level_summary |>
+  dplyr::mutate(
+    SEQ = factor(SEQ, levels = c("MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA"))
+  )
+
+ggplot(mvc_mdf_plot_df, aes(x = SEQ, y = mdf_mid_1s_hz_mean)) +
+  geom_point(size = 2) +
+  geom_line(aes(group = channel)) +
+  facet_wrap(~ channel, scales = "free_y") +
+  labs(
+    title = "MVC — MDF baseline vs recovery (middle 1s)",
+    x = NULL,
+    y = "MDF (Hz)"
+  )
+```
+
+```{r ex_dyn_peak_extract}
+#turn it dynamic later, if we keep ?
+ex_dyn_peak <- ex_dyn_mid1s_feature_table |>
+  dplyr::slice_max(torque_mean_Nm, n = 3) |>
+  dplyr::mutate(SEQ = "EX_DYN_PEAK")
+
+ex_dyn_peak
+
+# mvc_dyn_recovery_table}
+
+mvc_dyn_recovery_df <- dplyr::bind_rows(
+  mvc_level_summary,
+  ex_dyn_peak
+) |>
+  dplyr::filter(
+    SEQ %in% c("MVC_REF", "EX_DYN_PEAK", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+  )
+
+mvc_dyn_recovery_df
+```
+
+
+
+
+
+```{r mvc_dyn_recovery_plot}
+
+# ex_dynpeak (not dynamic yet)
+ex_dyn_peak_h <- ex_dyn_mid1s_feature_table |>
+  dplyr::slice_max(torque_mean_Nm, n = 3) |>
+  dplyr::mutate(
+    SEQ = "EX_DYN_PEAK",
+    n_reps = 1L,
+    rms_mid_1s_mean = rms_mid_1s,
+    mdf_mid_1s_hz_mean = mdf_mid_1s_hz
+  ) |>
+  dplyr::select(
+    SEQ, channel, n_reps,
+    torque_mean_Nm,
+    rms_mid_1s_mean,
+    mdf_mid_1s_hz_mean
+  )
+
+# traj
+mvc_dyn_recovery_df <- dplyr::bind_rows(
+  mvc_level_summary |>
+    dplyr::select(SEQ, channel, n_reps, torque_mean_Nm, rms_mid_1s_mean, mdf_mid_1s_hz_mean),
+  ex_dyn_peak_h
+) |>
+  dplyr::filter(SEQ %in% c("MVC_REF", "EX_DYN_PEAK", "MVC_RECOV_DYN", "MVC_RECOV_STA")) |>
+  dplyr::mutate(
+    SEQ = factor(SEQ, levels = c("MVC_REF", "EX_DYN_PEAK", "MVC_RECOV_DYN", "MVC_RECOV_STA"))
+  )
+
+# build table
+plot_long <- mvc_dyn_recovery_df |>
+  dplyr::group_by(SEQ) |>
+  dplyr::mutate(torque_mean_Nm = mean(torque_mean_Nm)) |>
+  dplyr::ungroup() |>
+  tidyr::pivot_longer(
+    cols = c(torque_mean_Nm, rms_mid_1s_mean, mdf_mid_1s_hz_mean),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(
+    metric = dplyr::recode(
+      metric,
+      torque_mean_Nm = "Torque (Nm)",
+      rms_mid_1s_mean = "RMS (a.u.)",
+      mdf_mid_1s_hz_mean = "MDF (Hz)"
+    ),
+    metric = factor(metric, levels = c("Torque (Nm)", "RMS (a.u.)", "MDF (Hz)"))
+  ) |>
+  dplyr::filter(is.finite(value))
+
+# Plot
+ggplot(plot_long, aes(x = SEQ, y = value)) +
+  geom_point(size = 2) +
+  geom_line(aes(group = channel)) +
+  facet_grid(metric ~ channel, scales = "free_y") +
+  scale_x_discrete(
+    labels = c(
+      MVC_REF = "MVC",
+      EX_DYN_PEAK = "EX_DYN peak",
+      MVC_RECOV_DYN = "RECOV dyn",
+      MVC_RECOV_STA = "RECOV sta"
+    )
+  ) +
+  labs(
+    title = "REF -> DYN -> R_DYN -> R_STA",
+    x = NULL,
+    y = NULL
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+check (emg 10 ??)
+
+```{r check_emg_10}
+# table
+mvc_dyn_recovery_check_wide <- mvc_dyn_recovery_df |>
+  dplyr::mutate(
+    SEQ = factor(SEQ, levels = c("MVC_REF", "EX_DYN_PEAK", "MVC_RECOV_DYN", "MVC_RECOV_STA"))
+  ) |>
+  dplyr::arrange(channel, SEQ) |>
+  dplyr::select(SEQ, channel, torque_mean_Nm, rms_mid_1s_mean, mdf_mid_1s_hz_mean) |>
+  tidyr::pivot_wider(
+    names_from = SEQ,
+    values_from = c(torque_mean_Nm, rms_mid_1s_mean, mdf_mid_1s_hz_mean),
+    names_glue = "{.value}__{SEQ}"
+  )
+
+mvc_dyn_recovery_check_wide
+```
+
+
+## RMS Normalization
+
+
+normalize ex_dyn
+
+```{r ex_dyn_mid1s_rms_normalization}
+ex_dyn_mid1s_feature_table_norm <- ex_dyn_mid1s_feature_table |>
+  dplyr::left_join(mvc_ref_mid1s_rms_baseline_table, by = "channel") |>
+  dplyr::mutate(
+    rms_norm = rms_mid_1s / rms_mvc_ref_mid1s_baseline
+  )
+
+print(ex_dyn_mid1s_feature_table_norm)
+```
+
+
+normalize ex_sta
+```{r ex_sta_mid1s_rms_normalization}
+ex_sta_mid1s_feature_table_norm <- ex_sta_mid1s_feature_table |>
+  dplyr::left_join(mvc_ref_mid1s_rms_baseline_table, by = "channel") |>
+  dplyr::mutate(
+    rms_norm = rms_mid_1s / rms_mvc_ref_mid1s_baseline
+  )
+
+print(ex_sta_mid1s_feature_table_norm)
+```
+
+
+# Fatigue Trend Modeling
+
+## MVC/SVC Trends
+
+```{r svc_ref_vc_plots_RMS_MF}
+svc_df <- svc_ref_mid1s_feature_table |>
+  dplyr::mutate(
+    VC_count  = as.integer(VC_count),
+    intensity = factor(VC_count,
+                       levels = c(1,2,3),
+                       labels = c("30% ","50% ","70%")),
+    torque_Nm = as.numeric(torque_mean_Nm)
+  ) |>
+  dplyr::filter(
+    is.finite(VC_count),
+    is.finite(torque_Nm),
+    is.finite(rms_mid_1s),
+    is.finite(mdf_mid_1s_hz)
+  )
+
+p_mdf <- ggplot(svc_df, aes(x = intensity, y = mdf_mid_1s_hz, group = 1)) +
+  geom_point(size = 2) +
+  geom_line() +
+  facet_wrap(~ channel, scales = "free_y") +
+  labs(
+    title = "SVC_REF - MDF (middle 1s)",
+    x = "Intensity (30/50/70% MVC)",
+    y = "MDF (Hz)"
+  )
+
+p_mdf
+
+p_rms <- ggplot(svc_df, aes(x = intensity, y = rms_mid_1s, group = 1)) +
+  geom_point(size = 2) +
+  geom_line() +
+  facet_wrap(~ channel, scales = "free_y") +
+  labs(
+    title = "SVC_REF - RMS across intensities (middle 1s)",
+    x = "Intensity (30/50/70% MVC)",
+    y = "RMS (a.u.)"
+  )
+
+p_rms
+```
+
+```{r percent_emg_vs_percent_force_svc_ref}
+# MVC torque baseline 
+torque_mvc_ref_baseline <- mvc_ref_mid1s_feature_table |>
+  dplyr::summarise(torque_mvc = mean(torque_mean_Nm, na.rm = TRUE)) |>
+  dplyr::pull(torque_mvc)
+
+# %EMG and %Force ()
+svc_pct_df <- svc_ref_mid1s_feature_table |>
+  dplyr::left_join(mvc_ref_mid1s_rms_baseline_table, by = "channel") |>
+  dplyr::mutate(
+    torque_pct = 100 * torque_mean_Nm / torque_mvc_ref_baseline,
+    emg_pct    = 100 * rms_mid_1s / rms_mvc_ref_mid1s_baseline,
+    intensity  = factor(VC_count, levels = c(1,2,3), labels = c("30%","50%","70%"))
+  )
+
+# %EMG vs %Force 
+ggplot(svc_pct_df, aes(x = torque_pct, y = emg_pct)) +
+  geom_point(aes(shape = intensity), size = 2) +
+  geom_line(aes(group = 1)) +
+  facet_wrap(~ channel, scales = "free_y") +
+  labs(
+    title = "SVC_REF - %EMG vs %Force (normalized to MVC_REF)",
+    x = "% Force (Torque / MVC_REF torque)",
+    y = "% EMG (RMS / MVC_REF RMS)"
+  )
+```
+
+```{r force_vs_emg_%}
+svc_pct_summary_table <- svc_pct_df |>
+  dplyr::group_by(channel) |>
+  dplyr::summarise(
+    `Slope (%EMG / %Force)` = coef(lm(emg_pct ~ torque_pct))[2],
+    `Pearson r (emg_pct, torque_pct)` = cor(emg_pct, torque_pct, use = "complete.obs"),
+    `R² (emg_pct ~ torque_pct)` = summary(lm(emg_pct ~ torque_pct))$r.squared,
+    .groups = "drop"
+  )
+
+svc_pct_summary_table
+```
+
+
+
+## EX_DYN Trends
+
+```{r ex_dyn_torque_vs_rep}
+ggplot(ex_dyn_mid1s_feature_table_norm,
+       aes(x = VC_count, y = torque_mean_Nm)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~ channel) +
+  labs(
+    title = "EX_DYN - Torque across repetitions",
+    x = "Repetition (VC_count)",
+    y = "Torque (Nm)"
+  )
+```
+
+
+```{r ex_dyn_rms_vs_torque}
+ggplot(ex_dyn_mid1s_feature_table_norm,
+       aes(x = torque_mean_Nm, y = rms_norm)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_wrap(~ channel) +
+  labs(
+    title = "EX_DYN - EMG activation vs produced torque",
+    x = "Torque (Nm)",
+    y = "Normalized RMS"
+  )
+```  
+
+
+```{r ex_dyn_mdf_vs_rep}
+ggplot(ex_dyn_mid1s_feature_table_norm,
+       aes(x = VC_count, y = mdf_mid_1s_hz)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_wrap(~ channel) +
+  labs(
+    title = "EX_DYN - Median frequency across repetitions",
+    x = "Repetition (VC_count)",
+    y = "Median frequency (Hz)"
+  )
+```
+
+```{r ex_dyn_mdf_vs_torque}
+
+ggplot(ex_dyn_mid1s_feature_table_norm,
+       aes(x = torque_mean_Nm, y = mdf_mid_1s_hz)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_wrap(~ channel) +
+  labs(
+    title = "EX_DYN - Median frequency vs torque",
+    x = "Torque (Nm)",
+    y = "Median frequency (Hz)"
+  )
+```  
+
+```{r ex_dyn_rms_vs_repetition}
+
+ggplot(ex_dyn_mid1s_feature_table_norm,
+       aes(x = VC_count, y = rms_norm)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_wrap(~ channel) +
+  labs(
+    title = "EX_DYN - Normalized RMS across repetitions",
+    x = "Repetition (VC_count)",
+    y = "Normalized RMS"
+  )
+```
+```{r ex_dyn_combined_fatigue_plot}
+ex_dyn_plot_long <- ex_dyn_mid1s_feature_table_norm |>
+  dplyr::select(channel, VC_count, torque_mean_Nm, rms_norm, mdf_mid_1s_hz) |>
+  tidyr::pivot_longer(
+    cols = c(torque_mean_Nm, rms_norm, mdf_mid_1s_hz),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(
+    metric = dplyr::recode(
+      metric,
+      torque_mean_Nm = "Torque (Nm)",
+      rms_norm = "RMS_norm (a.u.)",
+      mdf_mid_1s_hz = "MDF (Hz)"
+    ),
+    metric = factor(metric, levels = c("Torque (Nm)", "RMS_norm (a.u.)", "MDF (Hz)"))
+  )
+
+ggplot(ex_dyn_plot_long, aes(x = VC_count, y = value)) +
+  geom_point(alpha = 0.6, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(metric ~ channel, scales = "free_y") +
+  labs(
+    title = "EX_DYN - Fatigue progression (middle 1s): Torque, RMS_norm, MDF",
+    x = "Repetition (VC_count)",
+    y = NULL
+  )
+```
+
+## EX_STA Trends
+
+```{r ex_sta_triple_panel_fatigue}
+
+ex_sta_plot_long <- ex_sta_mid1s_feature_table_norm |>
+  dplyr::select(channel, window_id, torque_mean_Nm, rms_norm, mdf_mid_1s_hz) |>
+  tidyr::pivot_longer(
+    cols = c(torque_mean_Nm, rms_norm, mdf_mid_1s_hz),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(
+    metric = dplyr::recode(
+      metric,
+      torque_mean_Nm = "Torque (Nm)",
+      rms_norm = "RMS_norm (a.u.)",
+      mdf_mid_1s_hz = "MDF (Hz)"
+    ),
+    metric = factor(metric, levels = c("Torque (Nm)", "RMS_norm (a.u.)", "MDF (Hz)"))
+  )
+
+ggplot(ex_sta_plot_long, aes(x = window_id, y = value)) +
+  geom_point(alpha = 0.6, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(metric ~ channel, scales = "free_y") +
+  labs(
+    title = "EX_STA - Fatigue progression (1 s windows)",
+    x = "Time (s)",
+    y = NULL
+  )
+```
+
+
+## Trend Summary Table
+
+EX_DYN
+
+
+```{r ex_dyn_summary_slopes_with_units}
+
+ex_dyn_summary_table <-
+  ex_dyn_mid1s_feature_table_norm |>
+  dplyr::group_by(channel) |>
+  dplyr::summarise(
+
+    `Torque slope (Nm / rep)` =
+      coef(lm(torque_mean_Nm ~ VC_count))[2],
+
+    `RMS_norm slope (Δ RMS_norm / rep)` =
+      coef(lm(rms_norm ~ VC_count))[2],
+
+    `MDF slope (Hz / rep)` =
+      coef(lm(mdf_mid_1s_hz ~ VC_count))[2],
+
+    `RMS_norm vs Torque slope (Δ RMS_norm / Nm)` =
+      coef(lm(rms_norm ~ torque_mean_Nm))[2],
+
+    `MDF vs Torque slope (Hz / Nm)` =
+      coef(lm(mdf_mid_1s_hz ~ torque_mean_Nm))[2],
+
+    .groups = "drop"
+  )
+
+ex_dyn_summary_table
+
+```
+
+
+
+# Results
+
+## Torque Fatigue Profile
+
+
+## RMS Evolution
+
+## MDF Evolution
+
+# Technical Limitations
+
+
+
+

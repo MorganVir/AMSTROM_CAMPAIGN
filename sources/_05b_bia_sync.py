@@ -221,6 +221,7 @@ def run_bia_sync(
 
         df_out["time_index"] = time_index_valid
         df_out["SEQ_index"] = master_seq_index[time_index_valid]
+        df_out["SEQ"] = master_seq[time_index_valid]
         df_out["VC"] = master_vc[time_index_valid]
         df_out["VC_count"] = master_vc_count[time_index_valid]
 

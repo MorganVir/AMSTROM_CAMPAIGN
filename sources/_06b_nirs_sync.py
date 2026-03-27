@@ -235,6 +235,7 @@ def run_nirs_sync(
     # relabel from master
     ti = df_aligned["time_index"].to_numpy(dtype=int)
     df_aligned["SEQ_index"] = master_index_grid.loc[ti, "SEQ_index"].to_numpy()
+    df_aligned["SEQ"] = master_index_grid.loc[ti, "SEQ"].to_numpy()
     df_aligned["VC"] = master_index_grid.loc[ti, "VC"].to_numpy()
     df_aligned["VC_count"] = master_index_grid.loc[ti, "VC_count"].to_numpy()
 

@@ -40,7 +40,7 @@ def run_myoton_load_sync(
     for k in ["RUN_ID", "CACHE_DIR", "master_index_grid"]:
         assert k in ctx, f"{k} missing from ctx"
     
-    # constants (NO trailing commas!)
+    # constants 
     myo_taps_per_test = 5
     csv_sep = ";"
     plot_master_decim = 50
@@ -61,6 +61,9 @@ def run_myoton_load_sync(
     CACHE_MYOTON = cache_dir / "07_myoton_compact.parquet"
     if CACHE_MYOTON.exists() and not force_recompute:
         print("[07_myoton_import] Cache exist and has been loaded. Set force_recompute=True or delete cache to re-import and sync.")
+        # hotfix : still print the cache path so it can be registered in the dashboard for the final qc plot. Otherwise it fails on cache load.
+        ctx.setdefault("parquet_path", {})
+        ctx["parquet_path"]["CACHE_MYOTON"] = CACHE_MYOTON
         df = pd.read_parquet(CACHE_MYOTON)
         return df, None
 
@@ -144,12 +147,14 @@ def run_myoton_load_sync(
     assert (myo_time_index >= 0).all() and (myo_time_index < n).all()
 
     # Attach shared keys
+    master_seq_np = master_index_grid["SEQ"].to_numpy(dtype=object)
     master_seq_index_np = master_index_grid["SEQ_index"].to_numpy(dtype=int)
     master_vc_np = master_index_grid["VC"].to_numpy(dtype=int)
     master_vc_count_np = master_index_grid["VC_count"].to_numpy(dtype=int)
 
     myo_taps_df["time_index"] = myo_time_index
     myo_taps_df["SEQ_index"] = master_seq_index_np[myo_time_index]
+    myo_taps_df["SEQ"] = master_seq_np[myo_time_index]
     myo_taps_df["VC"] = master_vc_np[myo_time_index]
     myo_taps_df["VC_count"] = master_vc_count_np[myo_time_index]
 
@@ -160,6 +165,7 @@ def run_myoton_load_sync(
         "myo_time_s": ("myo_time_s", "median"),
         "time_index": ("time_index", "median"),
         "SEQ_index": ("SEQ_index", "median"),
+        "SEQ": ("SEQ", "first"),
         "VC": ("VC", "median"),
         "VC_count": ("VC_count", "median"),
     }
@@ -176,12 +182,12 @@ def run_myoton_load_sync(
 
     # Pack compact (taps + tests)
     taps_keep = [
-        "time_index", "SEQ_index", "VC", "VC_count",
+        "time_index", "SEQ_index", "SEQ", "VC", "VC_count",
         "myo_test_id", "myo_tap_in_test", "myo_time_s",
     ] + myo_metric_cols
 
     tests_keep = [
-        "time_index", "SEQ_index", "VC", "VC_count",
+        "time_index", "SEQ_index", "SEQ", "VC", "VC_count",
         "myo_test_id", "myo_time_s",
     ] + myo_metric_cols
 
@@ -192,7 +198,7 @@ def run_myoton_load_sync(
     tests_out["myo_tap_in_test"] = np.nan
     tests_out.insert(0, "row_type", "test")
 
-    col_order = ["row_type", "time_index", "SEQ_index", "VC", "VC_count",
+    col_order = ["row_type", "time_index", "SEQ_index", "SEQ", "VC", "VC_count",
                  "myo_test_id", "myo_tap_in_test", "myo_time_s"] + myo_metric_cols
 
     myoton_compact_df = pd.concat([taps_out, tests_out], ignore_index=True)[col_order]

@@ -196,6 +196,7 @@ def run_nirs_import(
     df.insert(1, "nirs_time_on_master_s", time_on_master_s)
 
     df["SEQ_index"] = master_index_grid.loc[mapped_idx, "SEQ_index"].to_numpy()
+    df["SEQ"] = master_index_grid.loc[mapped_idx, "SEQ"].to_numpy()
     df["VC"] = master_index_grid.loc[mapped_idx, "VC"].to_numpy()
     df["VC_count"] = master_index_grid.loc[mapped_idx, "VC_count"].to_numpy()
 
