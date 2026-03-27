@@ -184,7 +184,7 @@ def build_bia_compact_table(prefix: str, sample_timestamps_dt: np.ndarray, frequ
 # Cache load (if present) else compute + write cache
 
 if cache_all_present:
-    print("[05a_bia_import] cache hit -> loading parquet siblings")
+    print("[05a_bia_import] cache hit : loading existing parquets files.")
 
     bia2_compact_loaded = pd.read_parquet(cache_bia2_compact_path)
     bia4_compact_loaded = pd.read_parquet(cache_bia4_compact_path)
@@ -207,7 +207,7 @@ if cache_all_present:
     bia4_freqs_hz = bia4_freqs_loaded["freq_hz"].to_numpy(dtype=float)
 
 else:
-    print("[05a_bia_import] cache miss -> computing and writing parquet siblings")
+    print("[05a_bia_import] No cache present : computing and writing parquets files.")
 
     bia2_sample_timestamps_dt, bia2_frequency_values_hz, bia2_impedance_complex_matrix = load_bia_pickle_full_spectrum(bia2_pickle_path)
     bia4_sample_timestamps_dt, bia4_frequency_values_hz, bia4_impedance_complex_matrix = load_bia_pickle_full_spectrum(bia4_pickle_path)
@@ -223,7 +223,7 @@ else:
     pd.DataFrame({"freq_hz": bia2_freqs_hz}).to_parquet(cache_bia2_freqs_path, index=False)
     pd.DataFrame({"freq_hz": bia4_freqs_hz}).to_parquet(cache_bia4_freqs_path, index=False)
 
-    print("[05a_bia_import] wrote:")
+    print("[05a_bia_import] Cache file has been saved :")
     print("  -", cache_bia2_compact_path.name)
     print("  -", cache_bia4_compact_path.name)
     print("  -", cache_bia2_freqs_path.name)
