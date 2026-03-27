@@ -226,16 +226,16 @@ trash*/
 *.xlsx
 *.pkl
 *.csv
-<<<<<<< Updated upstream
 
 #cache (derived from running the pipeline)
 /data/derived
-=======
 *.parquet
->>>>>>> Stashed changes
 /results
 data/derived/011BeSa_20251023/cache/03a_sequence_picked.json
 .Rproj.user
 .RDataTmp
 .Rhistory
 .RData
+.RDataTmp1
+.vscode/settings.json
+*.md
