@@ -380,7 +380,7 @@ qc_figs.append((figA, "A__EMG_Torque"))
 
 #endregion
 
-#region FIG B - BIA time-domain (2PT + 4PT) at 3 freqs — step-line, no ZOH, no torque
+#region FIG B - BIA time-domain (2PT + 4PT) at 3 freqs 
 # Legend patch (visible in legend, not tied to shading alpha)
 active_seq_legend_handle = Patch(
     facecolor="orange",

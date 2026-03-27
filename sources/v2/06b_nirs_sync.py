@@ -92,7 +92,7 @@ else:
     shift_candidates_samples = np.rint(lag_candidates_s * master_fs_hz).astype(int)
 
     # ----------------------------
-    # Scoring function (FAST; Option B: strongest early HbDiff drop after VC onset)
+    # Scoring function (FAST; Option B: )strongest early HbDiff drop after VC onset)
     # ----------------------------
     nirs_time_index = nirs_compact_df["time_index"].to_numpy(dtype=int)
     nirs_signal = nirs_compact_df[NIRS_SYNC_SIGNAL_COL].to_numpy(dtype=float)
