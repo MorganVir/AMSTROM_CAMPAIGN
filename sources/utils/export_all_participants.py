@@ -29,7 +29,7 @@ LABEL_TO_FIELD = {
     "3. Commentaires / Observations pendant l'expérimentation": "comments",
 }
 
-REQUIRED_FIELDS = ["participant_id", "dob", "sex", "height_cm", "mass_kg", "delsys_ts_init"]
+REQUIRED_FIELDS = ["RUN_ID", "dob", "sex", "height_cm", "mass_kg", "delsys_ts_init"]
 
 
 def export_all_participants(
@@ -52,7 +52,12 @@ def export_all_participants(
         for label, field in LABEL_TO_FIELD.items():
             out[field] = s[label]
 
+        run_id = path.stem
+        if run_id.endswith("_Infos"):
+            run_id = run_id[: -len("_Infos")]
+
         out["participant_id"] = str(out["participant_id"]).strip()
+        out["RUN_ID"] = run_id.strip()
         out["sex"] = str(out["sex"]).strip()
 
         out["dob"] = pd.to_datetime(out["dob"]).normalize()
