@@ -1,6 +1,16 @@
-# 07_myoton_import_sync.py
-# Discrete MYOTON import + map to master grid (taps + per-test mean rows)
-# Cache: 07_myoton_compact.parquet
+# _07_myoton_import_sync.py - MYOTON IMPORT AND SYNC
+# Load discrete Myoton tap data from CSV and map tap events to the master timeline.
+#
+# Inputs
+#   ctx keys:  RUN_ID, CACHE_DIR, master_index_grid
+#   files:     data/raw_signal/myoton/<RUN_ID>*.csv
+#
+# Outputs (ctx keys set)
+#   - myoton_df                       (tap rows and per-test mean rows, mapped to time_index)
+#   - ctx['parquet_path']['CACHE_MYOTON'] updated
+#
+# Cache
+#   - 07_myoton_compact.parquet
 
 from pathlib import Path
 import numpy as np

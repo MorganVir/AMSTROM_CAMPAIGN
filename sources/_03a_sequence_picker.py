@@ -1,6 +1,18 @@
-# 03a_sequence_picker.py
-# Interactive SEQ boundary picker over torque plot
-# Step-owned artifact: 03a_sequence_picked.json
+# _03a_sequence_picker.py - INTERACTIVE SEQUENCE BOUNDARY PICKER
+# Manual click-based tool to mark protocol sequence boundaries on the torque signal.
+#
+# Inputs
+#   ctx keys:  RUN_ID, CACHE_DIR, master_index_grid, torque_compact_df, ts_ref
+#
+# Outputs (ctx keys set)
+#   - picked_sequences  (list of {seq, t_start, t_end} dicts)
+#
+# Cache
+#   - 03a_sequence_picked.json  (committed only after manual user validation)
+#
+# Notes
+#   - Requires interactive matplotlib backend; runs in Jupyter.
+#   - Automatic detection was impractical for this protocol; manual picking is fast and reliable.
 
 from pathlib import Path
 import json

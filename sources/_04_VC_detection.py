@@ -1,5 +1,21 @@
-# 04_vc_detection.py
-# Torque-based VC detection with per-SEQ knobs
+# _04_VC_detection.py - VOLUNTARY CONTRACTION DETECTION
+# Detect individual contractions from the torque signal and label them in the master grid.
+#
+# Inputs
+#   ctx keys:  RUN_ID, CACHE_DIR, master_index_grid, torque_compact_df, emg_compact_df
+#
+# Outputs (ctx keys updated)
+#   - master_index_grid  (VC and VC_count columns added)
+#   - torque_compact_df  (VC and VC_count propagated)
+#   - emg_compact_df     (VC and VC_count propagated)
+#
+# Cache
+#   - 04_vc_knobs_events.parquet  (committed after manual user validation)
+#
+# Notes
+#   - Detection is automatic (torque threshold) with per-SEQ manual knobs for edge cases.
+#   - VC_count increments within each SEQ; resets at each new sequence.
+#   - Human validation is required before committing to cache.
 
 from pathlib import Path
 import numpy as np

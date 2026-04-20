@@ -86,8 +86,8 @@ reference_level_feature_table <-
     SEQ             = dplyr::if_else(reference_level_id == 4L, "MVC_REF", "SVC_REF"),
     VC_count        = as.integer(reference_level_id),
     torque_frac     = ref_fracs[reference_level_id],
-    torque_mean_Nm  = TQ_MVC * torque_frac + rnorm(n(), 0, 1.8),
-    rms_mid_1s      = RMS_MVC[channel] * torque_frac * runif(n(), 0.93, 1.07),
+    torque_mean_Nm  = TQ_MVC * torque_frac + rnorm(n(), 0, 0.8),
+    rms_mid_1s      = RMS_MVC[channel] * (0.02 + 0.98 * torque_frac) + rnorm(n(), 0, RMS_MVC[channel] * 0.015),
     mdf_mid_1s_hz   = 108 + 14 * torque_frac + rnorm(n(), 0, 2.5),
     n_samples       = 2148L
   ) |>
@@ -129,6 +129,33 @@ reference_calibration_table_norm <- reference_level_feature_table_norm |>
 
 ref_norm_coefs <- reference_calibration_table_norm |>
   dplyr::select(channel, slope_ref = slope, intercept_ref = intercept)
+
+ref_rms_ci_df <- reference_level_feature_table_norm |>
+  dplyr::group_by(channel) |>
+  dplyr::group_modify(~{
+    fit <- lm(rms_norm ~ torque_norm, data = .x)
+
+    x_grid <- tibble::tibble(
+      torque_norm = seq(
+        min(.x$torque_norm, na.rm = TRUE),
+        max(.x$torque_norm, na.rm = TRUE),
+        length.out = 100
+      )
+    )
+
+    pred <- predict(
+      fit,
+      newdata = x_grid,
+      interval = "confidence",
+      level = 0.95
+    )
+
+    dplyr::bind_cols(
+      x_grid,
+      tibble::as_tibble(pred)
+    )
+  }) |>
+  dplyr::ungroup()
 
 # ── 1c. MVC level summary ────────────────────────────────────────────
 mvc_level_summary <-
@@ -286,7 +313,6 @@ ex_dyn_emg_torque_ratio_table <- ex_dyn_mid1s_feature_table_norm |>
   dplyr::select(-slope_ref, -intercept_ref)
 
 ex_sta_emg_torque_ratio_table <- ex_sta_mid1s_feature_table_norm |>
-  dplyr::left_join(ex_sta_window_table |> dplyr::select(window_id, window_mid_s), by = "window_id") |>
   dplyr::mutate(emg_torque_ratio = rms_norm / torque_norm) |>
   dplyr::select(SEQ, window_id, window_mid_s, channel, rms_norm, torque_norm, emg_torque_ratio) |>
   dplyr::left_join(ref_norm_coefs, by = "channel") |>
@@ -384,9 +410,14 @@ print(ex_dyn_reference_rms_overlay_plot)
 
 # B2. EX_DYN RMS overlay — normalized space + recovery star
 ex_dyn_reference_rms_overlay_plot_norm <- ggplot() +
-  geom_abline(
-    data = ex_dyn_reference_rms_fit_table_norm,
-    aes(intercept = intercept, slope = slope),
+  geom_ribbon(
+    data = ref_rms_ci_df,
+    aes(x = torque_norm, ymin = lwr, ymax = upr),
+    fill = PAL$ref_line, alpha = 0.12
+  ) +
+  geom_line(
+    data = ref_rms_ci_df,
+    aes(x = torque_norm, y = fit),
     colour = PAL$ref_line, linewidth = 1.0, alpha = 0.9
   ) +
   geom_point(data = ref_pts_rms_norm, aes(x = torque_norm, y = rms_norm),
@@ -404,7 +435,7 @@ ex_dyn_reference_rms_overlay_plot_norm <- ggplot() +
   scale_y_continuous(labels = label_percent(accuracy = 1, scale = 100)) +
   labs(
     title    = "EX_DYN — Normalized RMS vs reference fit",
-    subtitle = "Grey: reference levels & fit.  Colour: rep order.  \u2605 = MVC_RECOV_DYN.",
+    subtitle = "Grey: reference levels, fit, and 95% CI.  Colour: rep order.  * = MVC_RECOV_DYN.",
     x        = "Normalized torque  (% MVC)",
     y        = "Normalized RMS  (% MVC)"
   )
@@ -551,6 +582,7 @@ mvc_torque_plot_summary <- ggplot(
   geom_point(size = 4.5, colour = PAL$ref_line) +
   scale_x_discrete(labels = mvc_xlabels) +
   labs(title = "MVC — Torque across recovery checkpoints", x = NULL, y = "Torque  (Nm)")
+grid::grid.newpage()
 print(mvc_torque_plot_summary)
 
 # C2. RMS
@@ -564,6 +596,7 @@ mvc_recov_plot_summary <- ggplot(
   scale_y_continuous(labels = label_scientific()) +
   labs(title = "MVC — RMS across recovery checkpoints", x = NULL, y = "RMS  (a.u.)") +
   theme(axis.text.x = element_text(angle = 25, hjust = 1))
+grid::grid.newpage()
 print(mvc_recov_plot_summary)
 
 # C3. MDF
@@ -576,6 +609,7 @@ mvc_mdf_plot_summary <- ggplot(
   scale_x_discrete(labels = mvc_xlabels) +
   labs(title = "MVC — MDF across recovery checkpoints", x = NULL, y = "MDF  (Hz)") +
   theme(axis.text.x = element_text(angle = 25, hjust = 1))
+grid::grid.newpage()
 print(mvc_mdf_plot_summary)
 
 # C4. Triple panel 3x3
@@ -846,7 +880,6 @@ print(ex_sta_emg_torque_ratio_trend_plot)
 sta_metric_levels <- c("Norm. torque  (% MVC)", "Norm. RMS  (% MVC)", "MDF  (Hz)")
 
 ex_sta_plot_long <- ex_sta_mid1s_feature_table_norm |>
-  dplyr::left_join(ex_sta_window_table |> dplyr::select(window_id, window_mid_s), by = "window_id") |>
   dplyr::select(channel, window_id, window_mid_s, torque_norm, rms_norm, mdf_mid_1s_hz) |>
   tidyr::pivot_longer(c(torque_norm, rms_norm, mdf_mid_1s_hz),
                       names_to = "metric", values_to = "value") |>
@@ -896,4 +929,187 @@ ex_sta_triple_panel_fatigue <- ggplot(
   theme(strip.text.y = element_text(size = rel(0.78)))
 print(ex_sta_triple_panel_fatigue)
 
-message("\nAll 22 plots rendered. Edit theme_amstrom() or PAL to iterate.")
+# ══════════════════════════════════════════════════════════════════════
+# 7.  GROUP F — EMG10 recap
+# ══════════════════════════════════════════════════════════════════════
+
+target_channel <- "emg10"
+
+emg10_ref_rms_overlay_plot <- ggplot() +
+  geom_ribbon(
+    data = dplyr::filter(ref_rms_ci_df, channel == target_channel),
+    aes(x = torque_norm, ymin = lwr, ymax = upr),
+    fill = PAL$ref_line, alpha = 0.12
+  ) +
+  geom_line(
+    data = dplyr::filter(ref_rms_ci_df, channel == target_channel),
+    aes(x = torque_norm, y = fit),
+    colour = PAL$ref_line, linewidth = 1.0, alpha = 0.9
+  ) +
+  geom_point(
+    data = dplyr::filter(reference_level_feature_table_norm, channel == target_channel),
+    aes(x = torque_norm, y = rms_norm),
+    colour = PAL$ref_pt, size = 3.5, alpha = 0.95
+  ) +
+  geom_point(
+    data = dplyr::filter(ex_dyn_reference_rms_comparison_table_norm, channel == target_channel),
+    aes(x = torque_norm, y = observed_rms_norm, colour = VC_count),
+    size = 1.8, alpha = 0.75
+  ) +
+  geom_point(
+    data = dplyr::filter(mvc_recov_dyn_mid1s_feature_table_norm, channel == target_channel),
+    aes(x = torque_norm, y = rms_norm),
+    shape = 8, size = 3.0, stroke = 1.1, colour = PAL$recov,
+    inherit.aes = FALSE
+  ) +
+  grad_scale() +
+  labs(
+    title = "EMG10 recap — Reference RMS fit vs EX_DYN",
+    subtitle = "Grey = reference fit, 95% CI, and points; colour = EX_DYN repetitions; * = MVC_RECOV_DYN",
+    x = "Normalized torque  (% MVC)",
+    y = "Normalized RMS  (% MVC)"
+  ) +
+  scale_x_continuous(labels = label_percent(accuracy = 1, scale = 100)) +
+  scale_y_continuous(labels = label_percent(accuracy = 1, scale = 100))
+print(emg10_ref_rms_overlay_plot)
+
+emg10_dyn_ratio_plot <- ggplot(
+  dplyr::filter(dyn_ratio_long, channel == target_channel),
+  aes(x = VC_count, y = val, colour = series)
+) +
+  geom_line(linewidth = 0.85) +
+  geom_point(
+    data = dplyr::filter(dyn_ratio_long, channel == target_channel, series == "Observed"),
+    size = 1.5, alpha = 0.8
+  ) +
+  scale_colour_manual(
+    values = c(Observed = PAL$obs, `Expected (reference)` = PAL$expected), name = NULL
+  ) +
+  labs(
+    title = "EMG10 recap — EX_DYN EMG/torque ratio",
+    subtitle = "Observed versus expected ratio from reference calibration",
+    x = "Repetition",
+    y = "RMSnorm / torquenorm"
+  )
+print(emg10_dyn_ratio_plot)
+
+emg10_dyn_summary_plot <- ggplot(
+  dplyr::filter(ex_dyn_plot_long, channel == target_channel),
+  aes(x = VC_count, y = value, colour = VC_count)
+) +
+  geom_point(alpha = 0.7, size = 1.2) +
+  geom_point(
+    data = dplyr::filter(ex_dyn_recov_star_long, channel == target_channel),
+    aes(x = x_star, y = value),
+    shape = 8, size = 3.0, stroke = 1.1, colour = PAL$recov,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 1) +
+  grad_scale() +
+  labs(
+    title = "EMG10 recap — EX_DYN fatigue summary",
+    subtitle = "\u2605 = MVC_RECOV_DYN mean",
+    x = "Repetition",
+    y = NULL
+  )
+print(emg10_dyn_summary_plot)
+
+emg10_sta_ratio_plot <- ggplot(
+  dplyr::filter(sta_ratio_long, channel == target_channel),
+  aes(x = window_mid_s, y = val, colour = series)
+) +
+  geom_line(linewidth = 0.85) +
+  geom_point(
+    data = dplyr::filter(sta_ratio_long, channel == target_channel, series == "Observed"),
+    size = 1.5, alpha = 0.8
+  ) +
+  scale_colour_manual(
+    values = c(Observed = PAL$obs, `Expected (reference)` = PAL$expected), name = NULL
+  ) +
+  labs(
+    title = "EMG10 recap — EX_STA EMG/torque ratio",
+    subtitle = "Observed versus expected ratio from reference calibration",
+    x = "Time  (s)",
+    y = "RMSnorm / torquenorm"
+  )
+print(emg10_sta_ratio_plot)
+
+emg10_sta_summary_plot <- ggplot(
+  dplyr::filter(ex_sta_plot_long, channel == target_channel),
+  aes(x = window_mid_s, y = value, colour = window_mid_s)
+) +
+  geom_point(alpha = 0.7, size = 1.2) +
+  geom_point(
+    data = dplyr::filter(ex_sta_recov_star_long, channel == target_channel),
+    aes(x = x_star, y = value),
+    shape = 8, size = 3.0, stroke = 1.1, colour = PAL$recov,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 1) +
+  scale_color_viridis_c(option = "turbo", begin = 0.1, end = 0.85, name = "Time  (s)") +
+  labs(
+    title = "EMG10 recap — EX_STA fatigue summary",
+    subtitle = "\u2605 = MVC_RECOV_STA mean",
+    x = "Time  (s)",
+    y = NULL
+  )
+print(emg10_sta_summary_plot)
+
+# Optional redesign export: selected EMG-focused plots only.
+# Keeps the same RUN_ID-based naming idea as the Python QC export, but
+# writes a separate redesign file so it does not interfere with pipeline outputs.
+EXPORT_EMG_PLOTS <- TRUE
+EXPORT_RUN_ID <- "684LuSh_20251013"
+EXPORT_EMG10_REF_RMS <- TRUE
+EXPORT_EMG10_DYN_RATIO <- TRUE
+EXPORT_EMG10_DYN_SUMMARY <- TRUE
+EXPORT_EMG10_STA_RATIO <- TRUE
+EXPORT_EMG10_STA_SUMMARY <- TRUE
+
+plot_export_flags <- c(
+  emg10_ref_rms_overlay_plot = EXPORT_EMG10_REF_RMS,
+  emg10_dyn_ratio_plot = EXPORT_EMG10_DYN_RATIO,
+  emg10_dyn_summary_plot = EXPORT_EMG10_DYN_SUMMARY,
+  emg10_sta_ratio_plot = EXPORT_EMG10_STA_RATIO,
+  emg10_sta_summary_plot = EXPORT_EMG10_STA_SUMMARY
+)
+
+plot_export_map <- list(
+  emg10_ref_rms_overlay_plot = emg10_ref_rms_overlay_plot,
+  emg10_dyn_ratio_plot = emg10_dyn_ratio_plot,
+  emg10_dyn_summary_plot = emg10_dyn_summary_plot,
+  emg10_sta_ratio_plot = emg10_sta_ratio_plot,
+  emg10_sta_summary_plot = emg10_sta_summary_plot
+)
+
+if (isTRUE(EXPORT_EMG_PLOTS)) {
+  selected_plot_names <- names(plot_export_flags)[plot_export_flags]
+  if (length(selected_plot_names) == 0L) {
+    stop("EXPORT_EMG_PLOTS=TRUE but no EMG export plot selector is set to TRUE.")
+  }
+
+  qc_export_root <- file.path("results", "QC_EXPORT")
+  dir.create(qc_export_root, recursive = TRUE, showWarnings = FALSE)
+
+  qc_emg_export_path <- file.path(
+    qc_export_root,
+    paste0("qc_emg_export_", EXPORT_RUN_ID, ".pdf")
+  )
+
+  grDevices::pdf(
+    file = qc_emg_export_path,
+    width = 11,
+    height = 8.5,
+    onefile = TRUE
+  )
+
+  for (plot_name in selected_plot_names) {
+    print(plot_export_map[[plot_name]])
+  }
+
+  grDevices::dev.off()
+
+  message("\n[QC EMG EXPORT] PDF created -> ", normalizePath(qc_emg_export_path, winslash = "/", mustWork = FALSE))
+}
+
+message("\nAll 27 plots rendered. Edit theme_amstrom() or PAL to iterate.")

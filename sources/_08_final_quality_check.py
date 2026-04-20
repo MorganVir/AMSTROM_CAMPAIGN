@@ -1,5 +1,18 @@
-# _08_final_quality_check.py - FINAL QC FIGURES
-# Modular selection: overview_emg_torque / bia_time / bia_nyquist / nirs_tx / myoton
+# _08_final_quality_check.py - FINAL QUALITY CONTROL
+# Generate multimodal QC figures from cached parquet files (plot-only, no recompute).
+#
+# Inputs
+#   ctx keys:      RUN_ID, CACHE_DIR, master_index_grid, parquet_path (dict of cache paths)
+#   plot_selection: list of modules to render:
+#                  overview_emg_torque / bia_time / bia_nyquist / nirs_tx / myoton
+#
+# Outputs (ctx keys set)
+#   - qc_figs  (dict of matplotlib figures keyed by module name)
+#
+# Notes
+#   - Reads from cached parquet files, not from in-memory objects.
+#   - This ensures QC reflects what was actually written to disk, not transient pipeline state.
+#   - Figures are passed to _09_export.py for PDF compilation.
 
 
 from pathlib import Path
@@ -1179,13 +1192,5 @@ def run_final_qc(
             qc_figs.extend([f for f in out if f is not None])
         else:
             qc_figs.append(out)
-
-    # auto display (QC terminal step)
-    from IPython.display import clear_output, display
-
-    clear_output(wait=True)
-
-    for fig in qc_figs:
-        display(fig)
 
     return qc_figs

@@ -1,4 +1,24 @@
-# from __future__ import annotations
+# _02_emg_import.py - EMG IMPORT AND MASTER TIMELINE CONSTRUCTION
+# Load raw EMG + torque from the Delsys CSV and build the shared time grid.
+#
+# Inputs
+#   ctx keys:  CACHE_DIR, participants_df
+#   files:     data/raw_signal/emg/<RUN_ID>_DELSYS.csv
+#
+# Outputs (ctx keys set)
+#   - master_index_grid   (regular time backbone used by all modalities)
+#   - emg_compact_df      (EMG channels mapped to time_index)
+#   - torque_compact_df   (torque signal mapped to time_index)
+#   - ts_ref              (session reference timestamp from Delsys init)
+#
+# Cache
+#   - 02_master_index_grid.parquet
+#   - 02_emg_compact.parquet
+#   - 02_torque_compact.parquet
+#
+# Notes
+#   - Master timeline is reconstructed from the median EMG sampling interval (~2148 Hz).
+#   - All other modalities are mapped to this grid via nearest-neighbour matching.
 
 from pathlib import Path
 import csv

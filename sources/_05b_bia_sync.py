@@ -1,3 +1,21 @@
+# _05b_bia_sync.py - BIA SYNCHRONIZATION
+# Estimate and apply the temporal lag between BIA and the torque-derived master timeline.
+#
+# Inputs
+#   ctx keys:  RUN_ID, CACHE_DIR, bia2_df, bia4_df, master_index_grid (with VC labels)
+#
+# Outputs (ctx keys updated)
+#   - bia2_df, bia4_df  (time_index shifted to align with torque VC events)
+#
+# Cache
+#   - 05b_bia2_sync.parquet
+#   - 05b_bia4_sync.parquet
+#
+# Notes
+#   - Lag is estimated by maximising |Z| difference inside vs. outside VC within MVC_REF.
+#   - An integer time_index shift is applied; sub-sample precision is not needed here.
+#   - anchor_seq is fixed to MVC_REF; do not change without re-validating the lag search.
+
 from __future__ import annotations
 
 from pathlib import Path

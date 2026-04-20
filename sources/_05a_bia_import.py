@@ -1,5 +1,23 @@
-# 05a_bia_import.py
-# Load BIA 2PT / 4PT and map to master time_index
+# _05a_bia_import.py - BIA IMPORT
+# Load bioimpedance (2-point and 4-point) pkl files and map to the master timeline.
+#
+# Inputs
+#   ctx keys:  RUN_ID, CACHE_DIR, master_index_grid
+#   files:     data/raw_signal/bia/<RUN_ID>_BIA*.pkl  (2PT and 4PT pairs)
+#
+# Outputs (ctx keys set)
+#   - bia2_df, bia4_df             (impedance tables with time_index assigned)
+#   - ctx['parquet_path'] updated with BIA cache paths
+#
+# Cache
+#   - 05a_bia2_compact.parquet
+#   - 05a_bia4_compact.parquet
+#   - 05a_bia2_freqs_hz.parquet
+#   - 05a_bia4_freqs_hz.parquet
+#
+# Notes
+#   - BIA files come in pkl format from the LIRMM prototype acquisition system.
+#   - Timestamps are reconstructed from file metadata and mapped via nearest-neighbour.
 
 from pathlib import Path
 import pickle

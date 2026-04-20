@@ -1,4 +1,18 @@
-# sources/_06b_nirs_sync.py
+# _06b_nirs_sync.py - NIRS SYNCHRONIZATION
+# Estimate and apply the temporal lag between NIRS and the torque-derived master timeline.
+#
+# Inputs
+#   ctx keys:  RUN_ID, CACHE_DIR, nirs_df, master_index_grid (with VC labels)
+#
+# Outputs (ctx keys updated)
+#   - nirs_df  (time_index shifted to align HHb onset with torque VC events)
+#
+# Cache
+#   - 06b_nirs_sync.parquet
+#
+# Notes
+#   - Lag is scored using HHb onset slope relative to torque VC events in MVC_REF.
+#   - Applied as an integer time_index shift to account for physiological and system latency.
 
 # from __future__ import annotations
 
@@ -377,7 +391,7 @@ def run_nirs_sync(
     ax1_torque.legend(h1 + h2, l1 + l2, loc="upper left")
 
     ax2_torque = fig.add_subplot(3, 1, 2)
-    ax2_torque.set_title("BEFORE (unsynced) — Zoom on anchor")
+    ax2_torque.set_title("BEFORE (unsynced) - Zoom on anchor")
     for span_start_idx, span_end_idx in vc_spans_in_anchor:
         span_start_time = master_time_ref_s[span_start_idx]
         span_end_time = master_time_ref_s[span_end_idx]

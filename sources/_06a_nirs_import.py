@@ -1,5 +1,19 @@
-# 06a_nirs_import.py
-# Load Oxysoft NIRS txt + map to master time_index
+# _06a_nirs_import.py - NIRS IMPORT
+# Load PortaLite NIRS data from the Oxysoft TXT export and map to the master timeline.
+#
+# Inputs
+#   ctx keys:  RUN_ID, CACHE_DIR, master_index_grid, participants_df
+#   files:     data/raw_signal/nirs/<RUN_ID>*.txt  (Oxysoft export)
+#
+# Outputs (ctx keys set)
+#   - nirs_df  (O2Hb, HHb, tHb, HbDiff per transmitter, mapped to time_index)
+#
+# Cache
+#   - 06a_nirs_compact.parquet
+#
+# Notes
+#   - Timestamps are reconstructed from recording start time and nominal sampling rate (~10 Hz).
+#   - SRS-derived TSI is not computed; HHb is the primary oxygenation signal used downstream.
 
 from pathlib import Path
 import re

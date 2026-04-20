@@ -1,5 +1,22 @@
-# 03b_sequence_labeling.py
-# Apply SEQ labels to master_index_grid (and propagate to EMG / torque)
+# _03b_sequence_labeling.py - SEQUENCE LABEL APPLICATION
+# Apply SEQ phase labels from the picker JSON to the master grid, EMG, and torque tables.
+#
+# Inputs
+#   ctx keys:  RUN_ID, CACHE_DIR, master_index_grid, emg_compact_df, torque_compact_df
+#   cache:     03a_sequence_picked.json
+#
+# Outputs (ctx keys updated)
+#   - master_index_grid  (SEQ column added)
+#   - emg_compact_df     (SEQ column propagated)
+#   - torque_compact_df  (SEQ column propagated)
+#
+# Cache (overwrites step-02 caches after labeling)
+#   - 02_master_index_grid.parquet
+#   - 02_emg_compact.parquet
+#   - 02_torque_compact.parquet
+#
+# Notes
+#   - Overwrites the step-02 parquet caches in place; SEQ is part of the base grid contract.
 
 from pathlib import Path
 import json

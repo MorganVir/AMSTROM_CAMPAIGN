@@ -1,3 +1,20 @@
+# _01_participant.py - PARTICIPANT METADATA IMPORT
+# Load and clean the participant Excel template for one RUN_ID.
+#
+# Inputs
+#   ctx keys:  RUN_ID, CACHE_DIR
+#   files:     data/participants/<RUN_ID[:7]>*.xlsx
+#
+# Outputs (ctx keys set)
+#   - participants_df  (single-row DataFrame with cleaned metadata)
+#
+# Cache
+#   - 01_participants.parquet
+#
+# Notes
+#   - Non-standard cell values (e.g. "85 kg") are cleaned with regex before parsing.
+#   - Participant identity uses only the first 7 characters of RUN_ID as lookup key.
+
 from pathlib import Path
 import glob
 import re
