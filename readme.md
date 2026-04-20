@@ -10,7 +10,7 @@ Built on top of the the [Python minimal environment for reproducible research](h
 
 **Python** (see link above for environment setup)
 
-Core packages: `pandas`, `numpy`, `matplotlib`, `pathlib`, `pyarrow`
+Core packages: `pandas`, `numpy`, `matplotlib`, `pathlib`, `pyarrow`, `openpyxl`
 
 **R**
 
