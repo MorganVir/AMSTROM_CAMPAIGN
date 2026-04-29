@@ -97,6 +97,7 @@ def run_bia_sync(
     """
 
     # --- Resolve ctx ---
+    run_id            = ctx["RUN_ID"]
     cache_dir         = ctx["CACHE_DIR"]
     master_index_grid = ctx["master_index_grid"]
     bia2_compact_df   = ctx["bia2_compact_df"]
@@ -347,6 +348,7 @@ def run_bia_sync(
     )
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 7), sharex="col")
+    fig.suptitle(f"BIA sync QC — {run_id}", y=0.995)
 
     ax = axes[0, 0]
     ax.plot(torque_time_index[torque_in_anchor], torque_values[torque_in_anchor], alpha=0.85)
@@ -376,7 +378,7 @@ def run_bia_sync(
     ax.set_ylabel("|Z| (Ω)")
     ax.set_xlabel("Master time_index")
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.show()
 
     # --- Update ctx ---

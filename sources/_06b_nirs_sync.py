@@ -91,6 +91,7 @@ def run_nirs_sync(
     """
 
     # --- Resolve ctx ---
+    run_id            = ctx["RUN_ID"]
     cache_dir         = ctx["CACHE_DIR"]
     master_index_grid = ctx["master_index_grid"]
     nirs_compact_df   = ctx["nirs_compact_df"]
@@ -356,7 +357,7 @@ def run_nirs_sync(
 
     ax1_torque = fig.add_subplot(3, 1, 1)
     ax1_torque.set_title(
-        f"NIRS sync overview (anchor={ANCHOR_SEQ}) — OVERLAY "
+        f"NIRS sync overview — {run_id} (anchor={ANCHOR_SEQ}) — OVERLAY "
         f"| auto={best_lag_s_auto:.3f}s | manual={manual_nudge_s:.3f}s | total={total_lag_s:.3f}s"
     )
     ax1_torque.axvspan(anchor_start_time_s, anchor_end_time_s, facecolor=(0, 0, 0, 0.05), edgecolor="none")

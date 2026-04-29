@@ -241,3 +241,5 @@ data/derived/011BeSa_20251023/cache/03a_sequence_picked.json
 *.md
 .RDataTmp1
 .vscode/settings.json
+
+*.json
