@@ -1,0 +1,1054 @@
+---
+title: "AMSTROM - Multimodal Cohort Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+Cross-modal cohort analysis combining EMG, NIRS, BIA, and Myoton features.
+
+---
+
+# 1. Setup
+
+```{r load_libs}
+suppressPackageStartupMessages({
+  library(arrow)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(glue)
+})
+source(here::here("sources", "R", "config", "amstrom_style.R"))
+source(here::here("sources", "R", "config", "cohort_config.R"))
+```
+
+```{r controls}
+analysis_root <- here::here("results", "R_ANALYSIS")
+export_root   <- here::here("results", "DATA_EXPORT")
+registry_path <- file.path(analysis_root, "subset_registry",
+                            "multimodal_subset_registry.parquet")
+
+EMG_CHANNEL_PRIMARY <- "emg10"  # VL
+BIA_FREQ_PRIMARY    <- 48800L   # 48.8 kHz; PhA is most discriminating BIA fatigue marker
+                                 # (Dalton-Alves 2025, quadriceps leg press)
+
+PRINT_SUMMARY_TABLES <- FALSE
+```
+
+```{r modality_palette}
+modality_pal <- c(
+  "EMG nRMS (VL)"          = col_rms,
+  "NIRS dHHb (umol/L)"     = col_nirs,
+  "BIA PhA RelDev (%)"     = col_bia,
+  "nTorque"                = col_neutral_data
+)
+```
+
+---
+
+# 2. Run sets and intersection
+
+```{r load_registry}
+if (!file.exists(registry_path))
+  stop("Subset registry not found. Run multimodal_subset_checker.R first.")
+
+subset_registry <- arrow::read_parquet(registry_path)
+
+# cohort_final = four-way intersection minus EX_STA quality exclusions.
+multimodal_run_ids <- subset_registry |>
+  dplyr::filter(.data$analysis_block == "cohort_final", .data$included == 1L) |>
+  dplyr::pull(.data$RUN_ID) |>
+  sort()
+```
+
+```{r intersection}
+cat("Cohort N (cohort_final):", length(multimodal_run_ids), "\n")
+print(multimodal_run_ids)
+```
+
+---
+
+# 3. Pool data
+
+Each subsection pools one modality's per-run exports via `pool_from` (read each run's file,
+stack with `bind_rows`, warn on any missing). §3.5 then asserts every pooled table exposes
+the columns the downstream code relies on.
+
+```{r pool_helpers}
+pool_from <- function(run_ids, root, file_name) {
+  paths  <- file.path(root, run_ids, file_name)
+  exists <- file.exists(paths)
+  if (any(!exists))
+    warning(glue("Missing {sum(!exists)}/{length(run_ids)} file(s): {file_name}"))
+  return(dplyr::bind_rows(lapply(paths[exists], arrow::read_parquet)))
+}
+```
+
+## 3.1 EMG
+
+```{r pool_emg}
+emg_ex_dyn <- pool_from(multimodal_run_ids, analysis_root,
+                         "ex_dyn_mid1s_feature_table_norm.parquet")
+emg_ex_sta <- pool_from(multimodal_run_ids, analysis_root,
+                         "ex_sta_mid1s_feature_table_norm.parquet") |>
+  dplyr::group_by(.data$RUN_ID, .data$channel) |>
+  dplyr::arrange(.data$window_id, .by_group = TRUE) |>
+  dplyr::mutate(window_index = dplyr::row_number()) |>
+  dplyr::ungroup()
+
+cat("EMG EX_DYN runs:", dplyr::n_distinct(emg_ex_dyn$RUN_ID), "\n")
+cat("EMG EX_STA runs:", dplyr::n_distinct(emg_ex_sta$RUN_ID), "\n")
+```
+
+## 3.2 NIRS
+
+```{r pool_nirs}
+nirs_ex_dyn  <- pool_from(multimodal_run_ids, export_root,
+                            "nirs_ex_dyn_feature_table.parquet")
+nirs_ex_sta  <- pool_from(multimodal_run_ids, export_root,
+                            "nirs_ex_sta_feature_table.parquet")
+nirs_summary <- pool_from(multimodal_run_ids, export_root,
+                            "nirs_run_summary_table.parquet")
+
+cat("NIRS EX_DYN runs:", dplyr::n_distinct(nirs_ex_dyn$RUN_ID), "\n")
+cat("NIRS EX_STA runs:", dplyr::n_distinct(nirs_ex_sta$RUN_ID), "\n")
+```
+
+## 3.3 BIA
+
+```{r pool_bia}
+bia_ex_dyn  <- pool_from(multimodal_run_ids, analysis_root,
+                          "bia_ex_dyn_feature_table.parquet")
+bia_ex_sta  <- pool_from(multimodal_run_ids, analysis_root,
+                          "bia_ex_sta_feature_table.parquet")
+bia_summary <- pool_from(multimodal_run_ids, analysis_root,
+                          "bia_run_summary_table.parquet")
+
+cat("BIA EX_DYN runs:", dplyr::n_distinct(bia_ex_dyn$RUN_ID), "\n")
+cat("BIA EX_STA runs:", dplyr::n_distinct(bia_ex_sta$RUN_ID), "\n")
+```
+
+## 3.4 Myoton
+
+```{r pool_myoton}
+myoton_pooled <- pool_from(multimodal_run_ids, export_root,
+                             "myoton_checkpoint_feature_table.parquet")
+myoton_valid <- myoton_pooled |>
+  dplyr::filter(.data$sequence_valid == 1L)
+
+cat("Myoton rows pre/post sequence_valid filter:",
+    nrow(myoton_pooled), "/", nrow(myoton_valid),
+    "  runs (post):", dplyr::n_distinct(myoton_valid$RUN_ID), "\n")
+```
+
+## 3.5 Schema validation
+
+```{r validate_pools}
+# Fail fast if a pooled table is missing a column the downstream code expects.
+stopifnot(
+  all(c("RUN_ID", "channel", "VC_count", "rms_norm", "mdf_norm", "torque_norm") %in% names(emg_ex_dyn)),
+  all(c("RUN_ID", "channel", "window_id", "window_index", "rms_norm", "mdf_norm") %in% names(emg_ex_sta)),
+  all(c("RUN_ID", "VC_count", "hhb_from_baseline_umol") %in% names(nirs_ex_dyn)),
+  all(c("RUN_ID", "window_index", "hhb_from_baseline_umol") %in% names(nirs_ex_sta)),
+  all(c("RUN_ID", "summary_variable", "freq_hz", "reldev_pct", "VC_count") %in% names(bia_ex_dyn)),
+  all(c("RUN_ID", "summary_variable", "freq_hz", "reldev_pct", "window_index") %in% names(bia_ex_sta)),
+  all(c("RUN_ID", "checkpoint", "reldev_myo_Stiffness", "reldev_myo_Frequency") %in% names(myoton_valid))
+)
+cat("All pooled tables expose the expected columns.\n")
+```
+
+---
+
+# 4. EX_DYN trajectory overlay
+
+Five equal repetition phases allow cross-run comparison despite small differences in rep count.
+
+```{r ex_dyn_phase_emg}
+# EMG arm of the §4 overlay: per run bin reps into 5 phases (ntile), then cohort mean/SD of nRMS.
+emg_dyn_phase <- emg_ex_dyn |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$channel == EMG_CHANNEL_PRIMARY) |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::mutate(phase = dplyr::ntile(.data$VC_count, 5L)) |>  # split this run's reps into 5 equal phases
+  dplyr::ungroup() |>
+  dplyr::group_by(.data$phase) |>
+  dplyr::summarise(
+    mean_val = mean(.data$rms_norm, na.rm = TRUE),
+    sd_val   = sd(.data$rms_norm, na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  dplyr::mutate(modality = "EMG nRMS (VL)")
+```
+
+```{r ex_dyn_phase_nirs}
+# NIRS arm: same 5-phase binning, cohort mean/SD of ΔHHb from baseline.
+nirs_dyn_phase <- nirs_ex_dyn |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids) |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::mutate(phase = dplyr::ntile(.data$VC_count, 5L)) |>  # split this run's reps into 5 equal phases
+  dplyr::ungroup() |>
+  dplyr::group_by(.data$phase) |>
+  dplyr::summarise(
+    mean_val = mean(.data$hhb_from_baseline_umol, na.rm = TRUE),
+    sd_val   = sd(.data$hhb_from_baseline_umol, na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  dplyr::mutate(modality = "NIRS dHHb (umol/L)")
+```
+
+```{r ex_dyn_phase_bia}
+# BIA arm: same binning on PhA RelDev at the primary frequency (48.8 kHz).
+bia_dyn_phase <- bia_ex_dyn |>
+  dplyr::filter(
+    .data$RUN_ID %in% multimodal_run_ids,
+    .data$summary_variable == "PhA",
+    .data$freq_hz == BIA_FREQ_PRIMARY
+  ) |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::mutate(phase = dplyr::ntile(.data$VC_count, 5L)) |>  # split this run's reps into 5 equal phases
+  dplyr::ungroup() |>
+  dplyr::group_by(.data$phase) |>
+  dplyr::summarise(
+    mean_val = mean(.data$reldev_pct, na.rm = TRUE),
+    sd_val   = sd(.data$reldev_pct, na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  dplyr::mutate(modality = "BIA PhA RelDev (%)")
+```
+
+```{r ex_dyn_phase_torque}
+# Torque arm: same binning on nTorque (the load reference for the overlay).
+torque_dyn_phase <- emg_ex_dyn |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$channel == EMG_CHANNEL_PRIMARY) |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::mutate(phase = dplyr::ntile(.data$VC_count, 5L)) |>  # split this run's reps into 5 equal phases
+  dplyr::ungroup() |>
+  dplyr::group_by(.data$phase) |>
+  dplyr::summarise(
+    mean_val = mean(.data$torque_norm, na.rm = TRUE),
+    sd_val   = sd(.data$torque_norm, na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  dplyr::mutate(modality = "nTorque")
+```
+
+```{r ex_dyn_overlay_plot, fig.width=7, fig.height=10}
+# Stack the four modality arms and draw the faceted 5-phase EX_DYN overlay (mean +/- SD).
+overlay_dyn_plot <- dplyr::bind_rows(
+  emg_dyn_phase,
+  nirs_dyn_phase,
+  bia_dyn_phase,
+  torque_dyn_phase
+) |>
+  dplyr::mutate(
+    modality = factor(.data$modality, levels = names(modality_pal))
+  ) |>
+  ggplot2::ggplot(ggplot2::aes(
+    x      = .data$phase,
+    y      = .data$mean_val,
+    colour = .data$modality,
+    fill   = .data$modality
+  )) +
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed",
+                      colour = "grey72", linewidth = 0.4) +
+  ggplot2::geom_ribbon(
+    ggplot2::aes(ymin = .data$mean_val - .data$sd_val,
+                 ymax = .data$mean_val + .data$sd_val),
+    alpha = 0.15, colour = NA
+  ) +
+  ggplot2::geom_line(linewidth = 0.35) +
+  ggplot2::geom_point(shape = 15, size = 2.2) +
+  ggplot2::scale_x_continuous(breaks = 1:5, labels = paste0("P", 1:5)) +
+  ggplot2::scale_colour_manual(values = modality_pal, guide = "none") +
+  ggplot2::scale_fill_manual(values   = modality_pal, guide = "none") +
+  ggplot2::facet_wrap(~ modality, ncol = 1, scales = "free_y") +
+  ggplot2::labs(
+    x        = "Fatigue phase (ntile 5, P1 = early, P5 = late)",
+    y        = NULL,
+    title    = "EX_DYN - Multimodal fatigue trajectories",
+    subtitle = glue::glue(
+      "N = {length(multimodal_run_ids)} runs | 5-phase normalization (Song et al. 2025, 1273) | Mean +/- SD"
+    )
+  ) +
+  theme_amstrom_hgrid
+
+overlay_dyn_plot
+```
+
+## 4.1 EMG fatigue metrics — single-panel overlay
+
+nRMS, nMDF, and EMG/torque ratio on a shared %MVC axis.
+
+```{r triple_dyn_data}
+# EMG-only triple metric (nRMS, nMDF, ratio) per rep: pivot long, cohort mean/SD.
+triple_dyn_data <- emg_ex_dyn |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$channel == EMG_CHANNEL_PRIMARY) |>
+  dplyr::mutate(ratio = .data$rms_norm / .data$torque_norm) |>
+  tidyr::pivot_longer(
+    cols      = c("rms_norm", "mdf_norm", "ratio"),
+    names_to  = "metric",
+    values_to = "value"
+  ) |>
+  dplyr::group_by(.data$VC_count, .data$metric) |>
+  dplyr::summarise(
+    mean_val = mean(.data$value, na.rm = TRUE),
+    sd_val   = sd(.data$value,   na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  dplyr::mutate(
+    metric = dplyr::recode(.data$metric,
+      rms_norm = "nRMS",
+      mdf_norm = "nMDF",
+      ratio    = "EMG/torque ratio"
+    ),
+    metric = factor(.data$metric, levels = c("nRMS", "nMDF", "EMG/torque ratio"))
+  )
+```
+
+```{r triple_dyn_plot, fig.width=7, fig.height=5}
+ggplot2::ggplot(triple_dyn_data, ggplot2::aes(
+  x      = .data$VC_count,
+  y      = .data$mean_val,
+  colour = .data$metric
+)) +
+  ggplot2::geom_hline(yintercept = 1, linetype = "dashed",
+                      colour = "grey72", linewidth = 0.4) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(ymin = .data$mean_val - .data$sd_val,
+                 ymax = .data$mean_val + .data$sd_val),
+    width = 0, linewidth = 0.4, alpha = 0.28
+  ) +
+  ggplot2::geom_line(linetype = "dotted", linewidth = 0.35) +
+  ggplot2::geom_point(shape = 15, size = 2.0) +
+  ggplot2::scale_colour_manual(
+    values = c("nRMS" = col_rms, "nMDF" = col_mdf,
+               "EMG/torque ratio" = col_neutral_data),
+    name = NULL
+  ) +
+  ggplot2::scale_y_continuous(labels = function(x) round(x * 100)) +
+  ggplot2::labs(
+    x        = "Repetition",
+    y        = "% MVC",
+    title    = "EX_DYN - EMG fatigue metrics",
+    subtitle = glue::glue(
+      "N = {length(multimodal_run_ids)} | nRMS + nMDF + EMG/torque ratio | Mean ± SD | VL"
+    )
+  ) +
+  theme_amstrom_hgrid +
+  ggplot2::theme(
+    legend.position      = c(0.02, 0.97),
+    legend.justification = c(0, 1),
+    legend.background    = ggplot2::element_rect(fill = NA, colour = NA),
+    legend.key           = ggplot2::element_rect(fill = NA)
+  )
+```
+
+```{r emg_dyn_summary_table}
+# Summary table: nRMS/nMDF mean/SD at 7 representative EX_DYN reps (VL).
+emg_dyn_summary <- emg_ex_dyn |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$channel == EMG_CHANNEL_PRIMARY,
+                .data$VC_count %in% c(1, 10, 20, 30, 40, 50, 60)) |>
+  dplyr::group_by(.data$VC_count) |>
+  dplyr::summarise(
+    `nRMS mean` = round(mean(.data$rms_norm, na.rm = TRUE), 3),
+    `nRMS SD`   = round(sd(.data$rms_norm,   na.rm = TRUE), 3),
+    `nMDF mean` = round(mean(.data$mdf_norm,  na.rm = TRUE), 3),
+    `nMDF SD`   = round(sd(.data$mdf_norm,    na.rm = TRUE), 3),
+    N           = dplyr::n(),
+    .groups     = "drop"
+  ) |>
+  dplyr::rename(Rep = VC_count)
+
+knitr::kable(emg_dyn_summary,
+             caption = glue::glue("EX_DYN cohort summary — VL (emg10), N = {length(multimodal_run_ids)}"))
+```
+
+---
+
+# 5. EX_STA trajectory overlay
+
+## 5.0 Cross-modal windowing sanity check
+
+EMG, NIRS and BIA define windows independently; this check guards the cross-modal joins below.
+
+```{r ex_sta_windowing_check}
+nirs_bia_offset <- nirs_ex_sta |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids) |>
+  dplyr::select(.data$RUN_ID, .data$window_index,
+                nirs_tfs = "window_time_from_start_s") |>
+  dplyr::inner_join(
+    bia_ex_sta |>
+      dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                    .data$summary_variable == "PhA",
+                    .data$freq_hz == BIA_FREQ_PRIMARY) |>
+      dplyr::select(.data$RUN_ID, .data$window_index,
+                    bia_tfs = "window_time_from_start_s"),
+    by = c("RUN_ID", "window_index")
+  ) |>
+  dplyr::mutate(delta_s = .data$nirs_tfs - .data$bia_tfs)
+
+max_abs_delta <- max(abs(nirs_bia_offset$delta_s), na.rm = TRUE)
+cat("NIRS vs BIA window_time_from_start_s mismatch at matching window_index:\n")
+cat("  max |delta| =", round(max_abs_delta, 3), "s across",
+    nrow(nirs_bia_offset), "window-pairs from",
+    dplyr::n_distinct(nirs_bia_offset$RUN_ID), "runs\n")
+
+# Per-run window counts across modalities (multimodal intersection only)
+row_counts <- dplyr::bind_rows(
+  emg_ex_sta  |> dplyr::filter(.data$channel == EMG_CHANNEL_PRIMARY) |>
+    dplyr::count(.data$RUN_ID, name = "emg_n"),
+  nirs_ex_sta |> dplyr::count(.data$RUN_ID, name = "nirs_n"),
+  bia_ex_sta  |> dplyr::filter(.data$summary_variable == "PhA",
+                                .data$freq_hz == BIA_FREQ_PRIMARY) |>
+    dplyr::count(.data$RUN_ID, name = "bia_n")
+) |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::summarise(emg_n  = max(.data$emg_n,  na.rm = TRUE),
+                   nirs_n = max(.data$nirs_n, na.rm = TRUE),
+                   bia_n  = max(.data$bia_n,  na.rm = TRUE),
+                   .groups = "drop")
+
+mismatches <- sum(with(row_counts, emg_n != nirs_n | nirs_n != bia_n))
+cat("Runs with row-count mismatch across modalities:", mismatches,
+    "/", nrow(row_counts), "\n")
+cat("  -> handled by sta_n_min_multi truncation + inner_join (no silent corruption)\n")
+
+stopifnot(
+  "NIRS-BIA windowing offset exceeds 0.1 s — alignment is broken" =
+    max_abs_delta < 0.1
+)
+```
+
+## 5.1 Common-duration cap (`sta_n_min_multi`)
+
+```{r ex_sta_nmin}
+# Torque-based common duration from R/config/cohort_config.R.
+# Computed in emg_cohort_analysis.Rmd §6.4.6.5; update GLOBAL_STA_N_MIN there if params change.
+sta_n_min_multi <- GLOBAL_STA_N_MIN
+cat("EX_STA common n_min across all modalities:", sta_n_min_multi, "windows (GLOBAL_STA_N_MIN)\n")
+```
+
+```{r ex_sta_traj_build}
+# EX_STA overlay arms: cohort mean/SD per window for EMG (torque-gated), NIRS, and BIA PhA.
+emg_sta_traj <- emg_ex_sta |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$channel == EMG_CHANNEL_PRIMARY,
+                .data$window_index <= sta_n_min_multi,
+                .data$torque_norm >= 0.60) |>
+  dplyr::group_by(.data$window_index) |>
+  dplyr::summarise(
+    mean_val = mean(.data$rms_norm, na.rm = TRUE),
+    sd_val   = sd(.data$rms_norm, na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  dplyr::mutate(modality = "EMG nRMS (VL)")
+
+nirs_sta_traj <- nirs_ex_sta |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$window_index <= sta_n_min_multi) |>
+  dplyr::group_by(.data$window_index) |>
+  dplyr::summarise(
+    mean_val = mean(.data$hhb_from_baseline_umol, na.rm = TRUE),
+    sd_val   = sd(.data$hhb_from_baseline_umol, na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  dplyr::mutate(modality = "NIRS dHHb (umol/L)")
+
+bia_sta_traj <- bia_ex_sta |>
+  dplyr::filter(
+    .data$RUN_ID %in% multimodal_run_ids,
+    .data$summary_variable == "PhA",
+    .data$freq_hz == BIA_FREQ_PRIMARY,
+    .data$window_index <= sta_n_min_multi
+  ) |>
+  dplyr::group_by(.data$window_index) |>
+  dplyr::summarise(
+    mean_val = mean(.data$reldev_pct, na.rm = TRUE),
+    sd_val   = sd(.data$reldev_pct, na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  dplyr::mutate(modality = "BIA PhA RelDev (%)")
+```
+
+```{r ex_sta_overlay_plot, fig.width=7, fig.height=8}
+# Stack the three EX_STA arms and draw the faceted per-window overlay (mean +/- SD).
+overlay_sta_plot <- dplyr::bind_rows(
+  emg_sta_traj,
+  nirs_sta_traj,
+  bia_sta_traj
+) |>
+  dplyr::mutate(
+    modality = factor(.data$modality, levels = names(modality_pal))
+  ) |>
+  ggplot2::ggplot(ggplot2::aes(
+    x      = .data$window_index,
+    y      = .data$mean_val,
+    colour = .data$modality,
+    fill   = .data$modality
+  )) +
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed",
+                      colour = "grey72", linewidth = 0.4) +
+  ggplot2::geom_ribbon(
+    ggplot2::aes(ymin = .data$mean_val - .data$sd_val,
+                 ymax = .data$mean_val + .data$sd_val),
+    alpha = 0.15, colour = NA
+  ) +
+  ggplot2::geom_line(linewidth = 0.35) +
+  ggplot2::geom_point(shape = 15, size = 2.2) +
+  ggplot2::scale_colour_manual(values = modality_pal, guide = "none") +
+  ggplot2::scale_fill_manual(values   = modality_pal, guide = "none") +
+  ggplot2::facet_wrap(~ modality, ncol = 1, scales = "free_y") +
+  ggplot2::labs(
+    x        = "Window index (1 s windows from EX_STA onset)",
+    y        = NULL,
+    title    = "EX_STA - Multimodal fatigue trajectories",
+    subtitle = glue::glue(
+      "N = {length(multimodal_run_ids)} runs | Truncated at window {sta_n_min_multi} | Mean +/- SD"
+    )
+  ) +
+  theme_amstrom_hgrid
+
+overlay_sta_plot
+```
+
+---
+
+# 6. Per-run feature table
+
+One row per run for between-run correlation analysis.
+
+```{r build_feature_table}
+# EMG: nMDF slope, torque slope, and EMG/torque ratio slope over 60 reps (VL, EX_DYN)
+# Slope = OLS coefficient of feature ~ VC_count, one value per run
+emg_slopes <- emg_ex_dyn |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$channel == EMG_CHANNEL_PRIMARY) |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::arrange(.data$VC_count, .by_group = TRUE) |>
+  dplyr::summarise(
+    emg_mdf_slope   = coef(lm(mdf_norm                        ~ VC_count, na.action = na.omit))[["VC_count"]],
+    torque_slope    = coef(lm(torque_norm                     ~ VC_count, na.action = na.omit))[["VC_count"]],
+    emg_ratio_slope = coef(lm(I(rms_norm / torque_norm)       ~ VC_count, na.action = na.omit))[["VC_count"]],
+    .groups = "drop"
+  )
+
+# NIRS: EX_DYN deltaHHb slope (VC_count_linear_slope from run summary)
+nirs_features <- nirs_summary |>
+  dplyr::filter(
+    .data$RUN_ID %in% multimodal_run_ids,
+    .data$analysis_block  == "nirs_ex_dyn",
+    .data$summary_variable == "mean_hhb_umol",
+    .data$summary_type     == "VC_count_linear_slope"
+  ) |>
+  dplyr::select(.data$RUN_ID, nirs_hhb_slope = "summary_value")
+
+# BIA: EX_DYN PhA and R slopes at 48.8 kHz (VC_count_linear_slope from run summary)
+bia_features <- bia_summary |>
+  dplyr::filter(
+    .data$RUN_ID %in% multimodal_run_ids,
+    .data$analysis_block   == "bia_ex_dyn_run_summary",
+    .data$summary_variable %in% c("PhA", "R"),
+    .data$freq_hz          == BIA_FREQ_PRIMARY,
+    .data$summary_type     == "VC_count_linear_slope"
+  ) |>
+  dplyr::select(.data$RUN_ID, .data$summary_variable, .data$summary_value) |>
+  tidyr::pivot_wider(names_from = "summary_variable", values_from = "summary_value") |>
+  dplyr::rename(bia_pha_slope = "PhA", bia_r_slope = "R")
+
+# Myoton: stiffness reldev at after_dyn_1 (reldev baseline = before_dyn, pre-computed in pipeline)
+# Frequency excluded: f proportional to sqrt(S/m) in MyotonPRO model, algebraically linked
+# to stiffness and not an independent mechanical property.
+myoton_features <- myoton_valid |>
+  dplyr::filter(
+    .data$RUN_ID %in% multimodal_run_ids,
+    .data$checkpoint == "after_dyn_1"
+  ) |>
+  dplyr::select(
+    .data$RUN_ID,
+    myoton_stiffness_reldev = "reldev_myo_Stiffness"
+  )
+
+multimodal_feature_table <- emg_slopes |>
+  dplyr::left_join(nirs_features,   by = "RUN_ID") |>
+  dplyr::left_join(bia_features,    by = "RUN_ID") |>
+  dplyr::left_join(myoton_features, by = "RUN_ID")
+
+n_complete <- sum(complete.cases(multimodal_feature_table[, -1L]))
+cat(glue(
+  "Feature table: {nrow(multimodal_feature_table)} runs, {n_complete} complete rows\n"
+))
+```
+
+```{r show_feature_table, eval = PRINT_SUMMARY_TABLES}
+multimodal_feature_table |>
+  dplyr::mutate(dplyr::across(where(is.numeric), ~round(.x, 3))) |>
+  knitr::kable(caption = "Per-run multimodal fatigue features (EX_DYN)")
+```
+
+---
+
+# 7. Pearson correlation matrix
+
+Between-run Pearson r across the per-run fatigue features.
+
+```{r corr_matrix_data}
+# Between-run correlation: pick the per-run feature columns, then Pearson r (pairwise-complete).
+feat_cols <- c(
+  "emg_mdf_slope",
+  "emg_ratio_slope",
+  "nirs_hhb_slope",
+  "bia_pha_slope",
+  "bia_r_slope",
+  "myoton_stiffness_reldev",
+  "torque_slope"
+)
+feat_labels <- c(
+  "EMG nMDF\nslope",
+  "EMG/torque\nratio slope",
+  "NIRS HHb\nslope",
+  "BIA PhA\nslope",
+  "BIA R 48k\nslope",
+  "Myoton\nstiffness %",
+  "Torque\nslope"
+)
+
+corr_data <- multimodal_feature_table |>
+  dplyr::select(dplyr::all_of(feat_cols)) |>
+  setNames(feat_labels)
+
+corr_mat <- cor(corr_data, use = "pairwise.complete.obs")
+```
+
+```{r corr_matrix_plot, fig.width=9.5, fig.height=8.5}
+# Build lower-triangle data frame for ggplot2 (no ggcorrplot dependency)
+corr_long <- corr_mat |>
+  as.data.frame() |>
+  tibble::rownames_to_column("var1") |>
+  tidyr::pivot_longer(-.data$var1, names_to = "var2", values_to = "r") |>
+  dplyr::mutate(
+    var1 = factor(.data$var1, levels = feat_labels),
+    var2 = factor(.data$var2, levels = feat_labels),
+    r_label = ifelse(is.na(.data$r), "", sprintf("%.2f", .data$r))
+  ) |>
+  dplyr::filter(
+    as.integer(.data$var1) > as.integer(.data$var2)  # lower triangle only
+  )
+
+# Compute n for each pair for subtitle
+n_pairs <- corr_data |>
+  as.data.frame() |>
+  (function(d) {
+    sapply(feat_labels, function(v1)
+      sapply(feat_labels, function(v2)
+        sum(complete.cases(d[, c(v1, v2)]))))
+  })()
+min_n <- min(n_pairs[lower.tri(n_pairs)])
+max_n <- max(n_pairs[lower.tri(n_pairs)])
+
+corr_matrix_plot <- ggplot2::ggplot(
+  corr_long,
+  ggplot2::aes(x = .data$var2, y = .data$var1, fill = .data$r)
+) +
+  ggplot2::geom_tile(colour = "white", linewidth = 0.5) +
+  ggplot2::geom_text(
+    ggplot2::aes(label = .data$r_label),
+    size = 3.2, colour = "grey15"
+  ) +
+  ggplot2::scale_fill_gradient2(
+    low      = "#3B82F6",
+    mid      = "white",
+    high     = "#EF4444",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Pearson r"
+  ) +
+  ggplot2::scale_x_discrete(position = "bottom") +
+  ggplot2::labs(
+    x        = NULL,
+    y        = NULL,
+    title    = "Multimodal fatigue features - Pearson r matrix (EX_DYN)",
+    subtitle = glue::glue(
+      "N = {min_n}-{max_n} per pair | Slope-based features per run (a priori) | ",
+      "|r| > 0.50 = sig. at alpha=0.05 uncorrected; > 0.70 after Bonferroni (15 pairs)"
+    )
+  ) +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::theme(
+    axis.text.x      = ggplot2::element_text(angle = 30, hjust = 1, size = 9),
+    axis.text.y      = ggplot2::element_text(size = 9),
+    panel.grid       = ggplot2::element_blank(),
+    panel.border     = ggplot2::element_blank(),
+    plot.title       = ggplot2::element_text(face = "bold", size = 12),
+    plot.subtitle    = ggplot2::element_text(size = 9, colour = "grey40"),
+    legend.position  = "right"
+  )
+
+corr_matrix_plot
+```
+
+```{r corr_matrix_table}
+cat("Between-run Pearson r matrix (lower triangle):\n")
+print(round(corr_mat, 3))
+```
+
+---
+
+# 8. Within-run temporal coupling
+
+Per-run Pearson r between time-aligned signal pairs; cohort cells summarize those within-run correlations.
+
+```{r coupling_data_build}
+# Clean matrix: EMG + NIRS + BIA at 48.8 kHz (R, Xc, PhA)
+feat_cols_clean  <- c("nRMS", "nMDF", "ratio", "dHHb",
+                       "BIA_R_48k", "BIA_Xc_48k", "BIA_PhA_48k")
+feat_labels_clean <- c("nRMS", "nMDF", "EMG/torque\nratio", "dHHb", "R 48k", "Xc 48k", "PhA 48k")
+
+# Full matrix: adds absZ at 48.8 kHz + all four variables at 97.6 kHz
+# Rule: Xc/PhA valid only at >= 48.8 kHz (inductive artifact below — see project_bia_9khz_exclusion.md)
+feat_cols_full  <- c("nRMS", "nMDF", "ratio", "dHHb",
+                      "BIA_R_48k", "BIA_Xc_48k", "BIA_PhA_48k", "BIA_absZ_48k",
+                      "BIA_R_97k", "BIA_Xc_97k", "BIA_PhA_97k", "BIA_absZ_97k")
+feat_labels_full <- c("nRMS", "nMDF", "EMG/torque\nratio", "dHHb",
+                       "R 48k", "Xc 48k", "PhA 48k", "absZ 48k",
+                       "R 97k", "Xc 97k", "PhA 97k", "absZ 97k")
+
+# BIA: pivot all 4 variables at 48.8 and 97.6 kHz → one row per (RUN_ID, VC_count)
+bia_pivot_exdyn <- bia_ex_dyn |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$freq_hz %in% c(48800L, 97600L)) |>
+  dplyr::mutate(col_nm = paste0("BIA_", .data$summary_variable, "_",
+                                 as.integer(.data$freq_hz / 1000L), "k")) |>
+  dplyr::select(.data$RUN_ID, .data$VC_count, .data$col_nm, .data$reldev_pct) |>
+  tidyr::pivot_wider(names_from = "col_nm", values_from = "reldev_pct")
+
+bia_pivot_exsta <- bia_ex_sta |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$freq_hz %in% c(48800L, 97600L)) |>
+  dplyr::mutate(col_nm = paste0("BIA_", .data$summary_variable, "_",
+                                 as.integer(.data$freq_hz / 1000L), "k")) |>
+  dplyr::select(.data$RUN_ID, .data$window_id, .data$col_nm, .data$reldev_pct) |>
+  tidyr::pivot_wider(names_from = "col_nm", values_from = "reldev_pct")
+
+# Full 16-frequency BIA pivots for ML feature table (reldev_pct, all freqs x 4 variables).
+# Uses window_index (not window_id) as join key — matches coupling_exsta_data after window_id drop.
+bia_pivot_exdyn_ml <- bia_ex_dyn |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids) |>
+  dplyr::mutate(col_nm = paste0("bia_", tolower(.data$summary_variable), "_",
+                                 as.integer(.data$freq_hz / 1000L), "k")) |>
+  dplyr::select(.data$RUN_ID, .data$VC_count, .data$col_nm, .data$reldev_pct) |>
+  tidyr::pivot_wider(names_from = "col_nm", values_from = "reldev_pct")
+
+bia_pivot_exsta_ml <- bia_ex_sta |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids) |>
+  dplyr::mutate(col_nm = paste0("bia_", tolower(.data$summary_variable), "_",
+                                 as.integer(.data$freq_hz / 1000L), "k")) |>
+  dplyr::select(.data$RUN_ID, .data$window_index, .data$col_nm, .data$reldev_pct) |>
+  tidyr::pivot_wider(names_from = "col_nm", values_from = "reldev_pct")
+
+# EX_DYN coupling data
+coupling_exdyn_data <- emg_ex_dyn |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$channel == EMG_CHANNEL_PRIMARY) |>
+  dplyr::select(.data$RUN_ID, .data$VC_count, .data$torque_norm,
+                nRMS = "rms_norm", nMDF = "mdf_norm") |>
+  dplyr::inner_join(
+    nirs_ex_dyn |>
+      dplyr::filter(.data$RUN_ID %in% multimodal_run_ids) |>
+      dplyr::select(.data$RUN_ID, .data$VC_count,
+                    dHHb = "hhb_from_seq_rest_umol"),
+    by = c("RUN_ID", "VC_count")
+  ) |>
+  dplyr::inner_join(bia_pivot_exdyn, by = c("RUN_ID", "VC_count")) |>
+  dplyr::mutate(ratio = nRMS / torque_norm)
+
+# EX_STA coupling data — EMG is the anchor: defines valid windows via torque_norm >= 0.60.
+# NIRS and BIA join on window_id (same time-bin formula across all three pipelines).
+coupling_exsta_data <- emg_ex_sta |>
+  dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                .data$channel == EMG_CHANNEL_PRIMARY,
+                .data$window_index <= sta_n_min_multi,
+                .data$torque_norm >= 0.60) |>
+  dplyr::select(.data$RUN_ID, .data$window_id, .data$window_index,
+                nRMS = "rms_norm", nMDF = "mdf_norm") |>
+  dplyr::inner_join(
+    nirs_ex_sta |>
+      dplyr::filter(.data$RUN_ID %in% multimodal_run_ids) |>
+      dplyr::select(.data$RUN_ID, .data$window_id,
+                    dHHb = "hhb_from_seq_rest_umol"),
+    by = c("RUN_ID", "window_id")
+  ) |>
+  dplyr::inner_join(bia_pivot_exsta, by = c("RUN_ID", "window_id")) |>
+  dplyr::select(-.data$window_id) |>
+  dplyr::mutate(ratio = NA_real_)  # torque_norm not retained in EX_STA join; EX_STA parked
+
+cat("EX_DYN coupling rows:", nrow(coupling_exdyn_data),
+    " runs:", dplyr::n_distinct(coupling_exdyn_data$RUN_ID), "\n")
+cat("EX_STA coupling rows:", nrow(coupling_exsta_data),
+    " runs:", dplyr::n_distinct(coupling_exsta_data$RUN_ID), "\n")
+```
+
+```{r coupling_matrix_fn}
+# Coupling = cohort mean of *per-run* Pearson r. For each feature pair we correlate the two
+# signals within each run on its own, then average those r's across runs -- this keeps
+# within-run temporal coupling from being conflated with between-run differences (a single
+# pooled correlation would mix the two). safe_cor returns NA when a run has < 4 usable points.
+safe_cor <- function(x, y) {
+  ok <- complete.cases(x, y)
+  if (sum(ok) < 4L) return(NA_real_)
+  return(cor(x[ok], y[ok]))
+}
+
+compute_coupling_matrix <- function(data, feat_cols) {
+  pairs <- expand.grid(f1 = feat_cols, f2 = feat_cols, stringsAsFactors = FALSE)
+  results <- lapply(seq_len(nrow(pairs)), function(i) {
+    f1 <- pairs$f1[i]; f2 <- pairs$f2[i]
+    per_run_r <- data |>
+      dplyr::group_by(.data$RUN_ID) |>
+      dplyr::group_map(~ safe_cor(.x[[f1]], .x[[f2]])) |>
+      unlist()
+    data.frame(f1 = f1, f2 = f2,
+               mean_r = mean(per_run_r, na.rm = TRUE),
+               n_runs = sum(!is.na(per_run_r)))
+  })
+  return(dplyr::bind_rows(results) |>
+    dplyr::mutate(
+      f1      = factor(.data$f1, levels = feat_cols),
+      f2      = factor(.data$f2, levels = feat_cols),
+      r_label = dplyr::if_else(.data$f1 == .data$f2, "",
+                               sprintf("%.2f", .data$mean_r))
+    ))
+}
+
+plot_coupling_matrix <- function(mat, feat_cols, feat_labels, highlight_pairs,
+                                  title, subtitle) {
+  mat <- mat |>
+    dplyr::mutate(
+      pair_key     = paste(.data$f1, .data$f2, sep = "|"),
+      pair_key2    = paste(.data$f2, .data$f1, sep = "|"),
+      is_highlight = .data$pair_key %in% highlight_pairs |
+                     .data$pair_key2 %in% highlight_pairs,
+      fill_val     = dplyr::if_else(.data$f1 == .data$f2, NA_real_, .data$mean_r)
+    )
+  hl_df <- dplyr::filter(mat, .data$is_highlight)
+
+  return(ggplot2::ggplot(mat, ggplot2::aes(x = .data$f2, y = .data$f1)) +
+    ggplot2::geom_tile(ggplot2::aes(fill = .data$fill_val),
+                       colour = "white", linewidth = 0.5) +
+    ggplot2::geom_tile(data = hl_df, fill = NA,
+                       colour = "grey20", linewidth = 1.6) +
+    ggplot2::geom_text(ggplot2::aes(label = .data$r_label),
+                       size = 3.2, colour = "grey10") +
+    ggplot2::scale_fill_gradient2(
+      low = "#3B82F6", mid = "white", high = "#EF4444",
+      midpoint = 0, limits = c(-1, 1), name = "mean r",
+      na.value = "grey96"
+    ) +
+    ggplot2::scale_x_discrete(labels = setNames(feat_labels, feat_cols)) +
+    ggplot2::scale_y_discrete(labels = setNames(feat_labels, feat_cols)) +
+    ggplot2::labs(x = NULL, y = NULL, title = title, subtitle = subtitle) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      axis.text.x   = ggplot2::element_text(angle = 30, hjust = 1, size = 9),
+      axis.text.y   = ggplot2::element_text(size = 9),
+      panel.grid    = ggplot2::element_blank(),
+      panel.border  = ggplot2::element_blank(),
+      plot.title    = ggplot2::element_text(face = "bold", size = 12),
+      plot.subtitle = ggplot2::element_text(size = 9, colour = "grey40"),
+      legend.position = "right"
+    ))
+}
+```
+
+```{r coupling_exdyn_compute}
+coupling_mat_exdyn_clean <- compute_coupling_matrix(
+  dplyr::select(coupling_exdyn_data, .data$RUN_ID, dplyr::all_of(feat_cols_clean)),
+  feat_cols_clean
+)
+coupling_mat_exdyn_full <- compute_coupling_matrix(
+  dplyr::select(coupling_exdyn_data, .data$RUN_ID, dplyr::all_of(feat_cols_full)),
+  feat_cols_full
+)
+
+cat("EX_DYN temporal coupling (clean, cohort mean per-run r):\n")
+coupling_mat_exdyn_clean |>
+  dplyr::filter(.data$f1 != .data$f2) |>
+  dplyr::select(.data$f1, .data$f2, .data$mean_r, .data$n_runs) |>
+  dplyr::mutate(mean_r = round(.data$mean_r, 3)) |>
+  print()
+```
+
+```{r coupling_exdyn_plot_clean, fig.width=7, fig.height=6}
+plot_coupling_matrix(
+  mat             = coupling_mat_exdyn_clean,
+  feat_cols       = feat_cols_clean,
+  feat_labels     = feat_labels_clean,
+  highlight_pairs = c("nRMS|dHHb", "nMDF|dHHb"),
+  title    = "Within-run temporal coupling - EX_DYN",
+  subtitle = glue::glue(
+    "N = {dplyr::n_distinct(coupling_exdyn_data$RUN_ID)} runs | ",
+    "Cohort mean of per-run Pearson r over repetitions | ",
+    "Bold border: EMG x dHHb | Near-zero = hemodynamic lag (Kimoto 2023)"
+  )
+)
+```
+
+```{r coupling_exdyn_plot_full, fig.width=8.5, fig.height=7.5}
+plot_coupling_matrix(
+  mat             = coupling_mat_exdyn_full,
+  feat_cols       = feat_cols_full,
+  feat_labels     = feat_labels_full,
+  highlight_pairs = c("nRMS|dHHb", "nMDF|dHHb"),
+  title    = "Within-run temporal coupling - EX_DYN (full BIA)",
+  subtitle = glue::glue(
+    "N = {dplyr::n_distinct(coupling_exdyn_data$RUN_ID)} runs | ",
+    "BIA at 48.8 and 97.6 kHz | Cohort mean of per-run Pearson r"
+  )
+)
+```
+
+```{r coupling_exsta_compute}
+coupling_mat_exsta_clean <- compute_coupling_matrix(
+  dplyr::select(coupling_exsta_data, .data$RUN_ID, dplyr::all_of(feat_cols_clean)),
+  feat_cols_clean
+)
+coupling_mat_exsta_full <- compute_coupling_matrix(
+  dplyr::select(coupling_exsta_data, .data$RUN_ID, dplyr::all_of(feat_cols_full)),
+  feat_cols_full
+)
+
+cat("EX_STA temporal coupling (clean, cohort mean per-run r):\n")
+coupling_mat_exsta_clean |>
+  dplyr::filter(.data$f1 != .data$f2) |>
+  dplyr::select(.data$f1, .data$f2, .data$mean_r, .data$n_runs) |>
+  dplyr::mutate(mean_r = round(.data$mean_r, 3)) |>
+  print()
+
+nMDF_dHHb_exsta <- coupling_mat_exsta_clean |>
+  dplyr::filter(.data$f1 == "nMDF", .data$f2 == "dHHb")
+cat(glue::glue(
+  "nMDF x dHHb (EX_STA): mean r = {round(nMDF_dHHb_exsta$mean_r, 3)} ",
+  "across {nMDF_dHHb_exsta$n_runs} runs\n"
+))
+```
+
+```{r exsta_coupling_stats}
+# EX_STA coupling significance test — computed directly from the torque-filtered coupling data
+# (torque_norm >= 0.60 applied in coupling_exsta_data; consistent with coupling matrix)
+exsta_per_run_r <- coupling_exsta_data |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::summarise(
+    r_nmdf_hhb = safe_cor(nMDF, dHHb),
+    n_windows  = sum(!is.na(nMDF) & !is.na(dHHb)),
+    .groups    = "drop"
+  ) |>
+  dplyr::filter(!is.na(.data$r_nmdf_hhb))
+
+exsta_t  <- t.test(exsta_per_run_r$r_nmdf_hhb, mu = 0)
+exsta_dz <- mean(exsta_per_run_r$r_nmdf_hhb) / sd(exsta_per_run_r$r_nmdf_hhb)
+
+cat(glue::glue(
+  "── EX_STA coupling: nMDF x dHHb (EX_STA, torque >= 0.60, {nrow(exsta_per_run_r)} runs) ──\n",
+  "  Mean r : {round(mean(exsta_per_run_r$r_nmdf_hhb), 3)}\n",
+  "  SD r   : {round(sd(exsta_per_run_r$r_nmdf_hhb), 3)}\n",
+  "  t({exsta_t$parameter}) = {round(exsta_t$statistic, 3)}\n",
+  "  p      = {format.pval(exsta_t$p.value, digits = 3, eps = 0.001)}\n",
+  "  95% CI : [{round(exsta_t$conf.int[1], 3)}, {round(exsta_t$conf.int[2], 3)}]\n",
+  "  dz     = {round(exsta_dz, 3)}\n"
+))
+
+print(exsta_per_run_r)
+```
+
+```{r coupling_exsta_plot_clean, fig.width=6, fig.height=5}
+plot_coupling_matrix(
+  mat             = coupling_mat_exsta_clean,
+  feat_cols       = feat_cols_clean,
+  feat_labels     = feat_labels_clean,
+  highlight_pairs = c("nMDF|dHHb"),
+  title    = "Within-run temporal coupling - EX_STA",
+  subtitle = glue::glue(
+    "N = {dplyr::n_distinct(coupling_exsta_data$RUN_ID)} runs | ",
+    "{sta_n_min_multi} windows per run | Cohort mean of per-run Pearson r | ",
+    "Bold border: nMDF x dHHb (Scano 2020: MDF > RMS for NIRS coupling)"
+  )
+)
+```
+
+```{r coupling_exsta_plot_full, fig.width=8.5, fig.height=7.5}
+plot_coupling_matrix(
+  mat             = coupling_mat_exsta_full,
+  feat_cols       = feat_cols_full,
+  feat_labels     = feat_labels_full,
+  highlight_pairs = c("nMDF|dHHb"),
+  title    = "Within-run temporal coupling - EX_STA (full BIA)",
+  subtitle = glue::glue(
+    "N = {dplyr::n_distinct(coupling_exsta_data$RUN_ID)} runs | ",
+    "BIA at 48.8 and 97.6 kHz | Cohort mean of per-run Pearson r"
+  )
+)
+```
+
+---
+
+# 9. ML feature export
+
+One row per run per time point for downstream ML scripts.
+
+```{r ml_table_build}
+EXPORT_ML_FEATURES <- TRUE
+ml_export_path <- file.path(analysis_root, "multimodal_ml_feature_table.parquet")
+
+ml_exdyn <- coupling_exdyn_data |>
+  dplyr::select(RUN_ID, VC_count, nRMS, nMDF,
+                hhb_from_seq_rest_umol = dHHb, torque_norm) |>
+  dplyr::mutate(task = "EX_DYN") |>
+  dplyr::left_join(bia_pivot_exdyn_ml, by = c("RUN_ID", "VC_count")) |>
+  dplyr::rename(time_index = "VC_count")
+
+# EX_STA torque: pull from emg_ex_sta only if the column exists
+sta_has_torque <- "torque_norm" %in% names(emg_ex_sta)
+
+ml_exsta <- coupling_exsta_data |>
+  dplyr::select(RUN_ID, window_index, nRMS, nMDF,
+                hhb_from_seq_rest_umol = dHHb) |>
+  dplyr::mutate(task = "EX_STA") |>
+  dplyr::left_join(bia_pivot_exsta_ml, by = c("RUN_ID", "window_index")) |>
+  dplyr::rename(time_index = "window_index")
+
+if (sta_has_torque) {
+  sta_torque <- emg_ex_sta |>
+    dplyr::filter(.data$RUN_ID %in% multimodal_run_ids,
+                  .data$channel == EMG_CHANNEL_PRIMARY,
+                  .data$window_index <= sta_n_min_multi,
+                  .data$torque_norm >= 0.60) |>
+    dplyr::select(.data$RUN_ID, time_index = "window_index",
+                  torque_norm = "torque_norm")
+  ml_exsta <- dplyr::left_join(ml_exsta, sta_torque, by = c("RUN_ID", "time_index"))
+} else {
+  ml_exsta <- dplyr::mutate(ml_exsta, torque_norm = NA_real_)
+  message("torque_norm not found in emg_ex_sta — EX_STA torque_norm set to NA")
+}
+
+ml_table <- dplyr::bind_rows(ml_exdyn, ml_exsta)
+
+cat(glue::glue(
+  "ML table: {nrow(ml_table)} rows | {dplyr::n_distinct(ml_table$RUN_ID)} runs | ",
+  "EX_DYN: {sum(ml_table$task == 'EX_DYN')} rows | ",
+  "EX_STA: {sum(ml_table$task == 'EX_STA')} rows\n"
+))
+```
+
+```{r ml_feature_export, eval=EXPORT_ML_FEATURES}
+arrow::write_parquet(ml_table, ml_export_path)
+cat("Exported:", ml_export_path, "\n")
+```

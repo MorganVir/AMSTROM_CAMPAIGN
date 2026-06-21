@@ -1,0 +1,1066 @@
+---
+title: "Individual BIA Analysis Pipeline"
+author: "Morgan Virolan"
+date: "2026-05-15"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+
+params:
+  RUN_ID: "011BeSa_20251023"
+---
+
+# Overview
+
+Single-run BIA/EIM analysis: load aligned `bia4` data, build reference/EX_DYN/EX_STA features, fit Cole parameters, and write cohort-ready tables.
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(glue)
+
+options(dplyr.summarise.inform = FALSE)
+source(here::here("sources", "R", "config", "amstrom_style.R"))
+```
+
+```{r controls}
+RUN_ID <- params$RUN_ID
+
+PIPELINE_MODE <- "full_run"
+SHOW_MAIN_PLOT_GALLERY <- identical(PIPELINE_MODE, "full_run")
+EXPORT_BIA_PLOTS <- identical(PIPELINE_MODE, "full_run")
+EXPORT_ANALYSIS_TABLES <- identical(PIPELINE_MODE, "full_run")
+
+BIA_PRIMARY_CONFIG <- "bia4"
+BIA_TARGET_FREQS_HZ <- c(9760, 48800, 97600)
+BIS_ALL_FREQS_HZ    <- c(4880, 9760, 14640, 19520, 24400, 29280, 34160, 39040,
+                          48800, 58560, 68320, 78080, 87840, 97600, 107360, 122000)
+
+EX_STA_WINDOW_LENGTH_S <- 1.0
+EX_STA_WINDOW_STEP_S <- 1.0
+
+critical_seqs <- c("MVC_REF", "SVC_REF", "EX_DYN", "EX_STA", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+```
+
+# 2. Load exported data
+
+```{r load_data}
+# Load the aligned bia4 table + master grid + participant info for this run.
+export_root <- here::here("results", "DATA_EXPORT")
+run_directory <- file.path(export_root, RUN_ID)
+
+master_file_path <- file.path(run_directory, "master_index_grid.parquet")
+bia_file_path <- file.path(run_directory, "preprocessed_bia4.parquet")
+participant_file_path <- file.path(run_directory, "participant.parquet")
+
+master_table <- arrow::read_parquet(
+  master_file_path,
+  col_select = c("time_index", "time_ref_s", "SEQ_index", "SEQ", "VC", "VC_count")
+)
+
+bia_table <- arrow::read_parquet(bia_file_path)
+
+participant_table <- arrow::read_parquet(participant_file_path) |>
+  dplyr::mutate(RUN_ID = .env$RUN_ID, .before = 1)
+
+participant_id <- participant_table$participant_id[[1]]
+
+bia_analysis_table <- bia_table |>
+  dplyr::left_join(
+    master_table |>
+      dplyr::select(time_index, time_ref_s),
+    by = "time_index"
+  )
+
+cat("RUN_ID:", RUN_ID, "\n")
+cat("participant_id:", participant_id, "\n")
+cat("nrow(master_table):", nrow(master_table), "\n")
+cat("nrow(bia_table):   ", nrow(bia_table), "\n")
+cat("nrow(bia_analysis_table):", nrow(bia_analysis_table), "\n")
+```
+
+# 3. Sequence validity gate
+
+```{r check_bia_sequence_validity}
+# Validity gate: stop if any critical sequence is missing or flagged invalid.
+bia_validity <- bia_table |>
+  dplyr::distinct(.data$SEQ, .data$sequence_valid)
+
+print(bia_validity)
+
+bia_validity_crit <- bia_validity |>
+  dplyr::filter(.data$SEQ %in% critical_seqs)
+
+missing_critical_seqs <- setdiff(critical_seqs, bia_validity_crit$SEQ)
+if (length(missing_critical_seqs) > 0L) {
+  stop(glue(
+    "BIA sequence validity check FAILED for {RUN_ID}: missing critical sequence(s): ",
+    paste(missing_critical_seqs, collapse = ", ")
+  ))
+}
+
+invalid_bia_seqs <- bia_validity_crit |>
+  dplyr::filter(.data$sequence_valid == 0)
+
+if (nrow(invalid_bia_seqs) > 0L) {
+  stop(glue(
+    "BIA sequence validity check FAILED for {RUN_ID}:\n",
+    paste(capture.output(print(invalid_bia_seqs)), collapse = "\n")
+  ))
+}
+
+cat("BIA sequence validity OK for all critical sequences.\n")
+```
+
+# 4. Build the long BIA analysis table
+
+```{r build_bia_long_table}
+# BIA is much sparser than EMG. 
+# keep all BIA samples that already fall inside the contraction-labeled rows,
+# then summarise within VC_count or within 1 s static windows.
+
+build_bia_long <- function(df, config, freq_hz_vec) {
+  return(dplyr::bind_rows(lapply(freq_hz_vec, function(freq_hz) {
+    freq_tag <- gsub("\\.", "p", format(freq_hz, scientific = FALSE, trim = TRUE))
+    r_col <- glue("{config}_R_ohm__f_{freq_tag}Hz")
+    x_col <- glue("{config}_Xc_ohm__f_{freq_tag}Hz")
+    pha_col <- glue("{config}_PhA_deg__f_{freq_tag}Hz")
+
+    df |>
+      dplyr::mutate(
+        freq_hz = freq_hz,
+        R = .data[[r_col]],
+        Xc = .data[[x_col]],
+        PhA = .data[[pha_col]],
+        absZ = sqrt(.data$R^2 + .data$Xc^2)
+      ) |>
+      dplyr::select(
+        time_index, time_ref_s,
+        SEQ_index, SEQ, VC, VC_count,
+        sequence_valid,
+        freq_hz,
+        R, Xc, PhA, absZ
+      )
+  })) |>
+    tidyr::pivot_longer(
+      cols = c("R", "Xc", "PhA", "absZ"),
+      names_to = "summary_variable",
+      values_to = "summary_value"
+    ) |>
+    dplyr::mutate(
+      summary_unit = dplyr::case_when(
+        .data$summary_variable %in% c("R", "Xc", "absZ") ~ "ohm",
+        .data$summary_variable == "PhA" ~ "deg",
+        TRUE ~ NA_character_
+      ),
+      freq_label = factor(
+        .data$freq_hz,
+        levels = freq_hz_vec,
+        labels = vapply(freq_hz_vec, label_bia_frequency, character(1))
+      )
+    ))
+}
+
+bia_long_table <- build_bia_long(
+  df = bia_analysis_table,
+  config = BIA_PRIMARY_CONFIG,
+  freq_hz_vec = BIS_ALL_FREQS_HZ
+)
+```
+
+# 5. Reference and checkpoint tables
+
+```{r build_reference_checkpoint_feature_table}
+# Reference + checkpoint table: one row per sequence x VC_count x frequency x variable.
+# BIA is sparse (~2-3 Hz) so we just average the contraction-labeled samples within each
+# group rather than windowing. The reference_level labels (30/50/70/100%) come from the
+# SVC_REF rep order, with MVC_REF standing in as the 100% anchor.
+reference_checkpoint_feature_table <- bia_long_table |>
+  dplyr::filter(.data$SEQ %in% c("SVC_REF", "MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA")) |>
+  dplyr::filter(.data$VC == 1) |>
+  dplyr::group_by(
+    .data$SEQ, .data$VC_count,
+    .data$freq_hz, .data$freq_label,
+    .data$summary_variable, .data$summary_unit
+  ) |>
+  dplyr::summarise(
+    summary_value = mean(.data$summary_value, na.rm = TRUE),  # mean BIA value over the contraction
+    time_mid_s = mean(.data$time_ref_s, na.rm = TRUE),        # contraction midpoint time
+    n_samples = sum(is.finite(.data$summary_value)),          # BIA samples averaged
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    RUN_ID = .env$RUN_ID,
+    participant_id = .env$participant_id,
+    analysis_family = "bia",
+    analysis_block = "bia_reference_checkpoint",
+    source_sequence = .data$SEQ,
+    reference_level = dplyr::case_when(
+      .data$SEQ == "SVC_REF" & .data$VC_count == 1L ~ "30%",
+      .data$SEQ == "SVC_REF" & .data$VC_count == 2L ~ "50%",
+      .data$SEQ == "SVC_REF" & .data$VC_count == 3L ~ "70%",
+      .data$SEQ == "MVC_REF" ~ "100%",
+      TRUE ~ NA_character_
+    ),
+    state_label = dplyr::case_when(
+      .data$SEQ == "SVC_REF" ~ paste0("SVC_", .data$reference_level),
+      TRUE ~ .data$SEQ
+    ),
+    evidence_status = "provisional",
+    .before = 1
+  ) |>
+  dplyr::select(
+    RUN_ID, participant_id,
+    analysis_family, analysis_block,
+    source_sequence, state_label,
+    reference_level,
+    VC_count, freq_hz, freq_label,
+    summary_variable, summary_unit,
+    summary_value,
+    time_mid_s, n_samples,
+    evidence_status
+  ) |>
+  dplyr::arrange(.data$summary_variable, .data$freq_hz, .data$source_sequence, .data$VC_count)
+```
+
+# 6. EX_DYN trajectory table
+
+```{r build_ex_dyn_feature_table}
+# EX_DYN trajectory: same per-contraction averaging, one row per rep (capped at 60).
+bia_ex_dyn_feature_table <- bia_long_table |>
+  dplyr::filter(.data$SEQ == "EX_DYN", .data$VC == 1) |>
+  dplyr::group_by(
+    .data$SEQ, .data$VC_count,
+    .data$freq_hz, .data$freq_label,
+    .data$summary_variable, .data$summary_unit
+  ) |>
+  dplyr::summarise(
+    summary_value = mean(.data$summary_value, na.rm = TRUE),  # mean BIA value over the contraction
+    time_mid_s = mean(.data$time_ref_s, na.rm = TRUE),        # contraction midpoint time
+    n_samples = sum(is.finite(.data$summary_value)),          # BIA samples averaged
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    RUN_ID = .env$RUN_ID,
+    participant_id = .env$participant_id,
+    analysis_family = "bia",
+    analysis_block = "bia_ex_dyn",
+    source_sequence = .data$SEQ,
+    evidence_status = "provisional",
+    .before = 1
+  ) |>
+  dplyr::filter(.data$VC_count <= 60L) |>
+  dplyr::arrange(.data$summary_variable, .data$freq_hz, .data$VC_count)
+```
+
+# 7. EX_STA window table
+
+```{r build_ex_sta_feature_table}
+# EX_STA has no discrete reps, so bin the static hold into fixed 1 s windows and average the
+# BIA samples landing in each. Same time-binning the EMG and NIRS pipelines use -> the three
+# modalities share window_id, which is what makes the multimodal joins line up later.
+ex_sta_samples <- bia_long_table |>
+  dplyr::filter(.data$SEQ == "EX_STA", .data$VC == 1) |>
+  dplyr::arrange(.data$time_ref_s)
+
+if (nrow(ex_sta_samples) == 0L) {
+  stop("EX_STA contains no contraction-labeled BIA samples after filtering.")
+}
+
+t_start <- min(ex_sta_samples$time_ref_s)
+t_end <- max(ex_sta_samples$time_ref_s)
+window_start_s <- seq(t_start, t_end - EX_STA_WINDOW_LENGTH_S, by = EX_STA_WINDOW_STEP_S)
+
+ex_sta_window_table <- tibble::tibble(
+  window_id = seq_along(window_start_s),
+  window_start_s = window_start_s,
+  window_end_s = window_start_s + EX_STA_WINDOW_LENGTH_S,
+  window_mid_s = window_start_s + EX_STA_WINDOW_LENGTH_S / 2
+)
+
+bia_ex_sta_feature_table <- ex_sta_samples |>
+  dplyr::mutate(
+    window_id = floor((.data$time_ref_s - t_start) / EX_STA_WINDOW_STEP_S) + 1L
+  ) |>
+  dplyr::filter(
+    .data$window_id >= 1L,
+    .data$window_id <= nrow(ex_sta_window_table)
+  ) |>
+  dplyr::left_join(ex_sta_window_table, by = "window_id") |>
+  dplyr::group_by(
+    .data$window_id, .data$window_mid_s,
+    .data$freq_hz, .data$freq_label,
+    .data$summary_variable, .data$summary_unit
+  ) |>
+  dplyr::summarise(
+    summary_value = mean(.data$summary_value, na.rm = TRUE),  # mean BIA value in this 1s window
+    n_samples = sum(is.finite(.data$summary_value)),          # BIA samples averaged
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(.data$window_id, .data$freq_hz, .data$summary_variable)
+```
+
+```{r filter_ex_sta_onset_windows}
+# Common onset keeps the EX_STA denominator aligned with EMG and NIRS exports.
+EX_STA_COMMON_ONSET_WINDOW_ID <- 2L
+
+ex_sta_first_retained_window_id  <- EX_STA_COMMON_ONSET_WINDOW_ID
+ex_sta_first_retained_window_mid_s <- bia_ex_sta_feature_table |>
+  dplyr::distinct(.data$window_id, .data$window_mid_s) |>
+  dplyr::filter(.data$window_id == ex_sta_first_retained_window_id) |>
+  dplyr::pull(.data$window_mid_s)
+
+window_index_lookup <- bia_ex_sta_feature_table |>
+  dplyr::distinct(.data$window_id, .data$window_mid_s) |>
+  dplyr::filter(.data$window_id >= ex_sta_first_retained_window_id) |>
+  dplyr::arrange(.data$window_id) |>
+  dplyr::mutate(
+    window_index             = dplyr::row_number(),
+    window_time_from_start_s = .data$window_mid_s - ex_sta_first_retained_window_mid_s
+  ) |>
+  dplyr::select(window_id, window_index, window_time_from_start_s)
+
+bia_ex_sta_feature_table <- bia_ex_sta_feature_table |>
+  dplyr::filter(.data$window_id >= ex_sta_first_retained_window_id) |>
+  dplyr::left_join(window_index_lookup, by = "window_id") |>
+  dplyr::mutate(
+    RUN_ID = .env$RUN_ID,
+    participant_id = .env$participant_id,
+    analysis_family = "bia",
+    analysis_block = "bia_ex_sta",
+    source_sequence = "EX_STA",
+    evidence_status = "provisional",
+    .before = 1
+  ) |>
+  dplyr::select(
+    RUN_ID, participant_id,
+    analysis_family, analysis_block,
+    source_sequence,
+    window_id, window_index,
+    window_mid_s, window_time_from_start_s,
+    freq_hz, freq_label,
+    summary_variable, summary_unit,
+    summary_value,
+    n_samples,
+    evidence_status
+  ) |>
+  dplyr::arrange(.data$summary_variable, .data$freq_hz, .data$window_index)
+```
+
+# 7b. Cole model fitting
+
+```{r fit_cole_model, message=FALSE}
+# Cole model: Z(f) = R_inf + delta_R / (1 + (j·f/fc)^alpha)
+# Xc stored as negative (capacitive); model imaginary part is also negative — used as-is.
+# Drop 4.88–19.52 kHz range entirely: inductive parasitics corrupt Xc at these frequencies
+# (CV=32% at 9.76 kHz vs 2.2% at 48.8 kHz; positive-Xc hook artifacts at 9.76/14.64/19.52 kHz).
+# Cole fitting requires both R and Xc clean — cannot keep R-only at contaminated frequency points.
+# ML independently keeps R/|Z| at all 16 frequencies (independent columns, no arc constraint).
+all_sweep_freqs_hz <- sort(as.integer(
+  sub("bia4_R_ohm__f_(\\d+)Hz", "\\1",
+      grep("^bia4_R_ohm__f_\\d+Hz$", names(bia_analysis_table), value = TRUE))
+))
+cole_fit_freqs_hz <- all_sweep_freqs_hz[all_sweep_freqs_hz >= 24400L]
+
+cole_predict_arc <- function(freq_hz, R_inf, delta_R, fc_hz, alpha) {
+  u        <- (freq_hz / fc_hz)^alpha
+  cos_a    <- cos(alpha * pi / 2)
+  sin_a    <- sin(alpha * pi / 2)
+  denom_sq <- (1 + u * cos_a)^2 + (u * sin_a)^2
+  return(list(
+    R  = R_inf + delta_R * (1 + u * cos_a) / denom_sq,
+    Xc = -delta_R * u * sin_a / denom_sq
+  ))
+}
+
+cole_sse_fn <- function(params, freq_hz, R_obs, Xc_obs) {
+  pred <- cole_predict_arc(freq_hz, params[1L], params[2L], params[3L], params[4L])
+  return(sum((R_obs - pred$R)^2 + (Xc_obs - pred$Xc)^2))
+}
+
+fit_cole_arc <- function(R_obs, Xc_obs, freqs, n_starts = 10L) {
+  valid <- is.finite(R_obs) & is.finite(Xc_obs)
+  if (sum(valid) < 4L) {
+    return(tibble::tibble(R_inf = NA_real_, delta_R = NA_real_, R0 = NA_real_,
+                          fc_hz = NA_real_, alpha = NA_real_, fit_sse = NA_real_,
+                          fit_n_freq = sum(valid)))
+  }
+  R_obs <- R_obs[valid]; Xc_obs <- Xc_obs[valid]; freqs <- freqs[valid]
+
+  R_min        <- min(R_obs)
+  delta_R_init <- max(max(R_obs) - R_min, 1.0)
+  best_par <- NULL; best_sse <- Inf
+
+  # Multi-start to dodge local minima: start 1 is a sensible fixed guess, the rest random
+  # restarts. Keep whichever run converged to the lowest SSE.
+  for (i in seq_len(n_starts)) {
+    if (i == 1L) {
+      par_init <- c(R_min * 0.9, delta_R_init * 1.1, 70000, 0.75)
+    } else {
+      par_init <- c(
+        stats::runif(1L, 0.6 * R_min, R_min),
+        stats::runif(1L, 0.5 * delta_R_init, 2.0 * delta_R_init),
+        10^stats::runif(1L, log10(9760), log10(122000)),
+        stats::runif(1L, 0.50, 0.97)
+      )
+    }
+    res <- tryCatch(
+      stats::optim(
+        par    = par_init,
+        fn     = cole_sse_fn,
+        method = "L-BFGS-B",
+        lower  = c(0.01, 0.01, 1e3, 0.10),
+        upper  = c(1e4,  1e4,  1e7, 1.00),
+        freq_hz = freqs, R_obs = R_obs, Xc_obs = Xc_obs
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(res) && res$convergence %in% c(0L, 1L) && res$value < best_sse) {
+      best_sse <- res$value
+      best_par <- res$par
+    }
+  }
+
+  if (is.null(best_par)) {
+    return(tibble::tibble(R_inf = NA_real_, delta_R = NA_real_, R0 = NA_real_,
+                          fc_hz = NA_real_, alpha = NA_real_, fit_sse = NA_real_,
+                          fit_n_freq = as.integer(sum(valid))))
+  }
+  return(tibble::tibble(
+    R_inf      = best_par[1L],
+    delta_R    = best_par[2L],
+    R0         = best_par[1L] + best_par[2L],
+    fc_hz      = best_par[3L],
+    alpha      = best_par[4L],
+    fit_sse    = best_sse,
+    fit_n_freq = as.integer(sum(valid))
+  ))
+}
+
+set.seed(42L)
+
+# --- Reference / checkpoint sequences ---
+cole_input_ref <- bia_analysis_table |>
+  dplyr::filter(
+    .data$SEQ %in% c("SVC_REF", "MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA"),
+    .data$VC == 1L
+  ) |>
+  dplyr::group_by(.data$SEQ, .data$VC_count) |>
+  dplyr::summarise(
+    dplyr::across(
+      dplyr::matches("^bia4_(R|Xc)_ohm__f_\\d+Hz$"),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    n_samples = dplyr::n(),
+    .groups = "drop"
+  )
+
+cole_reference_table <- dplyr::bind_rows(lapply(seq_len(nrow(cole_input_ref)), function(i) {
+  row    <- cole_input_ref[i, ]
+  R_obs  <- as.numeric(row[paste0("bia4_R_ohm__f_",  cole_fit_freqs_hz, "Hz")])
+  Xc_obs <- as.numeric(row[paste0("bia4_Xc_ohm__f_", cole_fit_freqs_hz, "Hz")])
+  dplyr::bind_cols(
+    tibble::tibble(
+      RUN_ID          = RUN_ID,
+      participant_id  = participant_id,
+      source_sequence = row$SEQ[[1L]],
+      VC_count        = row$VC_count[[1L]],
+      n_samples       = row$n_samples[[1L]]
+    ),
+    fit_cole_arc(R_obs, Xc_obs, cole_fit_freqs_hz)
+  )
+}))
+
+# --- EX_DYN ---
+cole_input_exdyn <- bia_analysis_table |>
+  dplyr::filter(.data$SEQ == "EX_DYN", .data$VC == 1L, .data$VC_count <= 60L) |>
+  dplyr::group_by(.data$VC_count) |>
+  dplyr::summarise(
+    dplyr::across(
+      dplyr::matches("^bia4_(R|Xc)_ohm__f_\\d+Hz$"),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    n_samples = dplyr::n(),
+    .groups = "drop"
+  )
+
+cole_ex_dyn_table <- dplyr::bind_rows(lapply(seq_len(nrow(cole_input_exdyn)), function(i) {
+  row    <- cole_input_exdyn[i, ]
+  R_obs  <- as.numeric(row[paste0("bia4_R_ohm__f_",  cole_fit_freqs_hz, "Hz")])
+  Xc_obs <- as.numeric(row[paste0("bia4_Xc_ohm__f_", cole_fit_freqs_hz, "Hz")])
+  dplyr::bind_cols(
+    tibble::tibble(
+      RUN_ID          = RUN_ID,
+      participant_id  = participant_id,
+      source_sequence = "EX_DYN",
+      VC_count        = row$VC_count[[1L]],
+      n_samples       = row$n_samples[[1L]]
+    ),
+    fit_cole_arc(R_obs, Xc_obs, cole_fit_freqs_hz)
+  )
+}))
+
+# --- EX_STA (onset-retained windows only) ---
+# window_id assigned using same time-binning formula as build_ex_sta_feature_table.
+# window_index_lookup and ex_sta_first_retained_window_id are from filter_ex_sta_onset_windows.
+cole_input_exsta_raw <- bia_analysis_table |>
+  dplyr::filter(.data$SEQ == "EX_STA", .data$VC == 1L) |>
+  dplyr::mutate(
+    window_id = floor((.data$time_ref_s - t_start) / EX_STA_WINDOW_STEP_S) + 1L
+  ) |>
+  dplyr::filter(
+    .data$window_id >= 1L,
+    .data$window_id <= nrow(ex_sta_window_table),
+    .data$window_id >= ex_sta_first_retained_window_id
+  ) |>
+  dplyr::group_by(.data$window_id) |>
+  dplyr::summarise(
+    dplyr::across(
+      dplyr::matches("^bia4_(R|Xc)_ohm__f_\\d+Hz$"),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    n_samples = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::inner_join(window_index_lookup, by = "window_id")
+
+cole_ex_sta_table <- dplyr::bind_rows(lapply(seq_len(nrow(cole_input_exsta_raw)), function(i) {
+  row    <- cole_input_exsta_raw[i, ]
+  R_obs  <- as.numeric(row[paste0("bia4_R_ohm__f_",  cole_fit_freqs_hz, "Hz")])
+  Xc_obs <- as.numeric(row[paste0("bia4_Xc_ohm__f_", cole_fit_freqs_hz, "Hz")])
+  dplyr::bind_cols(
+    tibble::tibble(
+      RUN_ID                   = RUN_ID,
+      participant_id           = participant_id,
+      source_sequence          = "EX_STA",
+      window_id                = row$window_id[[1L]],
+      window_index             = row$window_index[[1L]],
+      window_time_from_start_s = row$window_time_from_start_s[[1L]],
+      n_samples                = row$n_samples[[1L]]
+    ),
+    fit_cole_arc(R_obs, Xc_obs, cole_fit_freqs_hz)
+  )
+}))
+
+cole_reference_table
+cole_ex_dyn_table |> dplyr::select(source_sequence, VC_count, R_inf, delta_R, R0, fc_hz, alpha, fit_sse)
+cole_ex_sta_table |> dplyr::select(window_index, R_inf, delta_R, R0, fc_hz, alpha, fit_sse)
+```
+
+# 8. Run-level summary table
+
+```{r build_bia_run_summary_table}
+# Run-level scalars in three flavours: linear slope over time, last-minus-first delta, and
+# checkpoint-minus-baseline (recovery vs MVC_REF). One value per frequency x variable.
+make_linear_slope_summary <- function(df, x_col, analysis_block, source_sequence) {
+  return(split(df, interaction(df$freq_hz, df$summary_variable, drop = TRUE)) |>
+    lapply(function(group_df) {
+      group_df <- group_df |>
+        dplyr::arrange(.data[[x_col]]) |>
+        dplyr::filter(is.finite(.data[[x_col]]), is.finite(.data$summary_value))
+
+      if (nrow(group_df) < 3L || dplyr::n_distinct(group_df[[x_col]]) < 3L) {
+        return(NULL)
+      }
+
+      fit_df <- group_df |>
+        dplyr::mutate(x_value = .data[[x_col]])
+
+      fit <- stats::lm(summary_value ~ x_value, data = fit_df)
+      tibble::tibble(
+        analysis_block = analysis_block,
+        freq_hz = group_df$freq_hz[[1]],
+        summary_variable = group_df$summary_variable[[1]],
+        summary_unit = group_df$summary_unit[[1]],
+        summary_type = paste0(x_col, "_linear_slope"),
+        source_sequence = source_sequence,
+        summary_value = unname(stats::coef(fit)[[2]]),
+        n_points = nrow(group_df)
+      )
+    }) |>
+    dplyr::bind_rows())
+}
+
+make_last_minus_first_summary <- function(df, x_col, analysis_block, source_sequence) {
+  return(split(df, interaction(df$freq_hz, df$summary_variable, drop = TRUE)) |>
+    lapply(function(group_df) {
+      group_df <- group_df |>
+        dplyr::arrange(.data[[x_col]]) |>
+        dplyr::filter(is.finite(.data[[x_col]]), is.finite(.data$summary_value))
+
+      if (nrow(group_df) < 2L) {
+        return(NULL)
+      }
+
+      tibble::tibble(
+        analysis_block = analysis_block,
+        freq_hz = group_df$freq_hz[[1]],
+        summary_variable = group_df$summary_variable[[1]],
+        summary_unit = group_df$summary_unit[[1]],
+        summary_type = "last_minus_first",
+        source_sequence = source_sequence,
+        summary_value = dplyr::last(group_df$summary_value) - dplyr::first(group_df$summary_value),
+        n_points = nrow(group_df)
+      )
+    }) |>
+    dplyr::bind_rows())
+}
+
+make_checkpoint_delta_summary <- function(df, checkpoint_seq) {
+  baseline_df <- df |>
+    dplyr::filter(.data$source_sequence == "MVC_REF") |>
+    dplyr::group_by(.data$freq_hz, .data$summary_variable, .data$summary_unit) |>
+    dplyr::summarise(baseline_value = mean(.data$summary_value, na.rm = TRUE), .groups = "drop")
+
+  checkpoint_df <- df |>
+    dplyr::filter(.data$source_sequence == checkpoint_seq) |>
+    dplyr::group_by(.data$freq_hz, .data$summary_variable, .data$summary_unit) |>
+    dplyr::summarise(checkpoint_value = mean(.data$summary_value, na.rm = TRUE), .groups = "drop")
+
+  return(dplyr::inner_join(
+    baseline_df,
+    checkpoint_df,
+    by = c("freq_hz", "summary_variable", "summary_unit")
+  ) |>
+    dplyr::mutate(
+      analysis_block = "bia_reference_checkpoint_summary",
+      summary_type = paste0(tolower(checkpoint_seq), "_minus_mvc_ref"),
+      source_sequence = checkpoint_seq,
+      summary_value = .data$checkpoint_value - .data$baseline_value,
+      n_points = NA_integer_
+    ) |>
+    dplyr::select(
+      analysis_block,
+      freq_hz,
+      summary_variable,
+      summary_unit,
+      summary_type,
+      source_sequence,
+      summary_value,
+      n_points
+    ))
+}
+
+bia_run_summary_table <- dplyr::bind_rows(
+  make_linear_slope_summary(bia_ex_dyn_feature_table, "VC_count", "bia_ex_dyn_run_summary", "EX_DYN"),
+  make_last_minus_first_summary(bia_ex_dyn_feature_table, "VC_count", "bia_ex_dyn_run_summary", "EX_DYN"),
+  make_linear_slope_summary(bia_ex_sta_feature_table, "window_index", "bia_ex_sta_run_summary", "EX_STA"),
+  make_last_minus_first_summary(bia_ex_sta_feature_table, "window_index", "bia_ex_sta_run_summary", "EX_STA"),
+  make_checkpoint_delta_summary(reference_checkpoint_feature_table, "MVC_RECOV_DYN"),
+  make_checkpoint_delta_summary(reference_checkpoint_feature_table, "MVC_RECOV_STA")
+) |>
+  dplyr::mutate(
+    RUN_ID = .env$RUN_ID,
+    participant_id = .env$participant_id,
+    analysis_family = "bia",
+    evidence_status = "provisional",
+    source_sequence = .data$source_sequence,
+    .before = 1
+  ) |>
+  dplyr::select(
+    RUN_ID, participant_id,
+    analysis_family, analysis_block,
+    summary_variable, summary_value,
+    summary_unit, summary_type,
+    source_sequence, evidence_status,
+    freq_hz, n_points
+  ) |>
+  dplyr::arrange(.data$analysis_block, .data$summary_variable, .data$freq_hz, .data$summary_type)
+```
+
+# 9. Diagnostic plots
+
+```{r compute_reldev}
+# RelDev = (value - ref_mean) / ref_mean * 100.
+# EX_DYN and reference checkpoints: MVC_REF (100% pre-fatigue) — same intensity as EX_DYN.
+# EX_STA: SVC_70% (actual measured 70% pre-fatigue) — same intensity as EX_STA.
+# Using MVC_REF for EX_STA would confound the activation-level difference with fatigue !
+mvc_ref_baseline <- reference_checkpoint_feature_table |>
+  dplyr::filter(.data$source_sequence == "MVC_REF") |>
+  dplyr::group_by(.data$freq_hz, .data$summary_variable) |>
+  dplyr::summarise(ref_mean = mean(.data$summary_value, na.rm = TRUE), .groups = "drop")
+
+svc_70_baseline <- reference_checkpoint_feature_table |>
+  dplyr::filter(.data$reference_level == "70%") |>
+  dplyr::group_by(.data$freq_hz, .data$summary_variable) |>
+  dplyr::summarise(ref_mean = mean(.data$summary_value, na.rm = TRUE), .groups = "drop")
+
+join_reldev <- function(df, baseline) {
+  return(df |>
+    dplyr::left_join(baseline, by = c("freq_hz", "summary_variable")) |>
+    dplyr::mutate(reldev_pct = (.data$summary_value - .data$ref_mean) / .data$ref_mean * 100) |>  # % deviation from the matched reference
+    dplyr::select(-ref_mean))
+}
+
+reference_checkpoint_feature_table <- join_reldev(reference_checkpoint_feature_table, mvc_ref_baseline)
+bia_ex_dyn_feature_table           <- join_reldev(bia_ex_dyn_feature_table, mvc_ref_baseline)
+bia_ex_sta_feature_table           <- join_reldev(bia_ex_sta_feature_table, svc_70_baseline)
+
+# reldev_seq_pct: within-sequence relative change, baselined on the first 3 contractions/windows.
+# This is the first-to-last RelDev convention -- change measured within the exercise sequence itself.
+add_reldev_seq <- function(df, time_var) {
+  seq_ref <- df |>
+    dplyr::filter(.data[[time_var]] <= 3L) |>
+    dplyr::group_by(.data$freq_hz, .data$summary_variable) |>
+    dplyr::summarise(seq_ref_mean = mean(.data$summary_value, na.rm = TRUE), .groups = "drop")
+  return(df |>
+    dplyr::left_join(seq_ref, by = c("freq_hz", "summary_variable")) |>
+    dplyr::mutate(reldev_seq_pct = (.data$summary_value - .data$seq_ref_mean) / .data$seq_ref_mean * 100) |>  # % change vs the sequence's first 3 points
+    dplyr::select(-seq_ref_mean))
+}
+
+bia_ex_dyn_feature_table <- add_reldev_seq(bia_ex_dyn_feature_table, "VC_count")
+bia_ex_sta_feature_table <- add_reldev_seq(bia_ex_sta_feature_table, "window_index")
+```
+
+```{r build_bia_plots}
+reference_state_levels <- c("SVC_30%", "SVC_50%", "SVC_70%", "MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+
+bia_ex_dyn_plot_tbl <- dplyr::filter(bia_ex_dyn_feature_table, .data$freq_hz %in% BIA_TARGET_FREQS_HZ)
+bia_ex_sta_plot_tbl <- dplyr::filter(bia_ex_sta_feature_table, .data$freq_hz %in% BIA_TARGET_FREQS_HZ)
+
+# SVC_REF rows already have distinct state_labels per intensity (30/50/70%)
+# MVC-type sequences have multiple VC_counts at the same intensity (so we average across them)
+bia_reference_plot_table <- dplyr::bind_rows(
+  reference_checkpoint_feature_table |>
+    dplyr::filter(.data$source_sequence == "SVC_REF"),
+  reference_checkpoint_feature_table |>
+    dplyr::filter(.data$source_sequence != "SVC_REF") |>
+    dplyr::group_by(
+      .data$source_sequence, .data$state_label,
+      .data$freq_hz, .data$freq_label,
+      .data$summary_variable, .data$summary_unit
+    ) |>
+    dplyr::summarise(
+      summary_value = mean(.data$summary_value, na.rm = TRUE),
+      n_samples     = sum(.data$n_samples, na.rm = TRUE),
+      .groups = "drop"
+    )
+) |>
+  dplyr::filter(.data$freq_hz %in% BIA_TARGET_FREQS_HZ) |>
+  dplyr::mutate(
+    state_label = factor(.data$state_label, levels = reference_state_levels)
+  )
+
+bia_reference_plot <- ggplot(
+  bia_reference_plot_table,
+  aes(x = .data$state_label, y = .data$summary_value, colour = .data$freq_label, group = .data$freq_label)
+) +
+  geom_line(linetype = "dotted", linewidth = 0.35) +
+  geom_point(shape = 15, size = 2.2) +
+  facet_wrap(~ summary_variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = paste0("BIA reference and checkpoint overview - ", RUN_ID),
+    x = NULL,
+    y = NULL,
+    colour = "Frequency"
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+bia_ex_dyn_plot <- ggplot(
+  bia_ex_dyn_plot_tbl,
+  aes(x = .data$VC_count, y = .data$summary_value, colour = .data$freq_label, group = .data$freq_label)
+) +
+  geom_line(linetype = "dotted", linewidth = 0.35) +
+  geom_point(shape = 15, size = 2.2) +
+  facet_wrap(~ summary_variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = paste0("BIA EX_DYN trajectories - ", RUN_ID),
+    x = "Repetition (VC_count)",
+    y = NULL,
+    colour = "Frequency"
+  ) +
+  theme_amstrom_hgrid
+
+bia_ex_sta_plot <- ggplot(
+  bia_ex_sta_plot_tbl,
+  aes(x = .data$window_index, y = .data$summary_value, colour = .data$freq_label, group = .data$freq_label)
+) +
+  geom_line(linetype = "dotted", linewidth = 0.35) +
+  geom_point(shape = 15, size = 2.2) +
+  facet_wrap(~ summary_variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = paste0("BIA EX_STA trajectories - ", RUN_ID),
+    x = "Window index",
+    y = NULL,
+    colour = "Frequency"
+  ) +
+  theme_amstrom_hgrid
+
+plot_export_map <- list(
+  reference_checkpoint = bia_reference_plot,
+  ex_dyn = bia_ex_dyn_plot,
+  ex_sta = bia_ex_sta_plot
+)
+```
+
+```{r build_reldev_plots}
+bia_ex_dyn_plot_tbl <- dplyr::filter(bia_ex_dyn_feature_table, .data$freq_hz %in% BIA_TARGET_FREQS_HZ)
+bia_ex_sta_plot_tbl <- dplyr::filter(bia_ex_sta_feature_table, .data$freq_hz %in% BIA_TARGET_FREQS_HZ)
+
+bia_reference_reldev_plot_table <- dplyr::bind_rows(
+  reference_checkpoint_feature_table |>
+    dplyr::filter(.data$source_sequence == "SVC_REF"),
+  reference_checkpoint_feature_table |>
+    dplyr::filter(.data$source_sequence != "SVC_REF") |>
+    dplyr::group_by(
+      .data$source_sequence, .data$state_label,
+      .data$freq_hz, .data$freq_label,
+      .data$summary_variable, .data$summary_unit
+    ) |>
+    dplyr::summarise(reldev_pct = mean(.data$reldev_pct, na.rm = TRUE), .groups = "drop")
+) |>
+  dplyr::filter(.data$freq_hz %in% BIA_TARGET_FREQS_HZ) |>
+  dplyr::mutate(state_label = factor(.data$state_label, levels = reference_state_levels))
+
+bia_reference_reldev_plot <- ggplot(
+  bia_reference_reldev_plot_table,
+  aes(x = .data$state_label, y = .data$reldev_pct, colour = .data$freq_label, group = .data$freq_label)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+  geom_line(linetype = "dotted", linewidth = 0.35) +
+  geom_point(shape = 15, size = 2.2) +
+  facet_wrap(~ summary_variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = paste0("BIA reference RelDev from MVC_REF - ", RUN_ID),
+    x = NULL,
+    y = "RelDev (%)",
+    colour = "Frequency"
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+bia_ex_dyn_reldev_plot <- ggplot(
+  bia_ex_dyn_plot_tbl,
+  aes(x = .data$VC_count, y = .data$reldev_pct, colour = .data$freq_label, group = .data$freq_label)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+  geom_line(linetype = "dotted", linewidth = 0.35) +
+  geom_point(shape = 15, size = 2.2) +
+  facet_wrap(~ summary_variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = paste0("BIA EX_DYN RelDev from MVC_REF - ", RUN_ID),
+    x = "Repetition",
+    y = "RelDev (%)",
+    colour = "Frequency"
+  ) +
+  theme_amstrom_hgrid
+
+bia_ex_sta_reldev_plot <- ggplot(
+  bia_ex_sta_plot_tbl,
+  aes(x = .data$window_index, y = .data$reldev_pct, colour = .data$freq_label, group = .data$freq_label)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+  geom_line(linetype = "dotted", linewidth = 0.35) +
+  geom_point(shape = 15, size = 2.2) +
+  facet_wrap(~ summary_variable, scales = "free_y", ncol = 2) +
+  labs(
+    title = paste0("BIA EX_STA RelDev from MVC_REF - ", RUN_ID),
+    x = "Window index",
+    y = "RelDev (%)",
+    colour = "Frequency"
+  ) +
+  theme_amstrom_hgrid
+
+plot_export_map[["reference_reldev"]] <- bia_reference_reldev_plot
+plot_export_map[["ex_dyn_reldev"]]    <- bia_ex_dyn_reldev_plot
+plot_export_map[["ex_sta_reldev"]]    <- bia_ex_sta_reldev_plot
+```
+
+```{r bia_nyquist_plot}
+# Nyquist arcs (R vs -Xc across the full sweep), one panel per sequence. Each panel holds a
+# few snapshots coloured fresh -> late: reference sequences get one arc per VC_count, EX_DYN
+# picks 5 reps spread across the set, EX_STA picks 5 equally spaced timepoints.
+nyquist_panel_seqs  <- c("MVC_REF", "EX_DYN", "EX_STA", "SVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+reference_seqs_nyq  <- c("MVC_REF", "SVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+ex_dyn_target_reps  <- c(1L, 16L, 31L, 46L, 60L)
+ex_sta_time_labels  <- c("t0", "t25", "t50", "t75", "t100")
+
+sweep_freqs_hz <- sort(as.integer(
+  sub("bia4_R_ohm__f_(\\d+)Hz", "\\1",
+      grep("^bia4_R_ohm__f_\\d+Hz$", names(bia_analysis_table), value = TRUE))
+))
+
+nyquist_seq_index_map <- bia_analysis_table |>
+  dplyr::distinct(.data$SEQ, .data$SEQ_index) |>
+  dplyr::filter(.data$SEQ %in% nyquist_panel_seqs) |>
+  tibble::deframe()
+
+extract_nyquist_arc <- function(row_df, freqs) {
+  return(tibble::tibble(
+    freq_hz  = freqs,
+    R        = vapply(freqs, function(f) as.numeric(row_df[[paste0("bia4_R_ohm__f_", f, "Hz")]]), numeric(1)),
+    minus_Xc = vapply(freqs, function(f) -as.numeric(row_df[[paste0("bia4_Xc_ohm__f_", f, "Hz")]]), numeric(1))
+  ))
+}
+
+pick_mid_row <- function(df) return(df[max(1L, ceiling(nrow(df) / 2L)), ])
+
+nyquist_data <- dplyr::bind_rows(lapply(nyquist_panel_seqs, function(seq_name) {
+  if (!seq_name %in% names(nyquist_seq_index_map)) return(NULL)
+  seq_idx <- nyquist_seq_index_map[[seq_name]]
+  df_seq  <- bia_analysis_table[
+    as.integer(bia_analysis_table$SEQ_index) == seq_idx &
+    as.integer(bia_analysis_table$VC_count)  >  0L, ]
+  if (nrow(df_seq) == 0L) return(NULL)
+
+  curves <- if (seq_name %in% reference_seqs_nyq) {
+    vc_ids <- sort(unique(as.integer(df_seq$VC_count)))
+    lapply(seq_along(vc_ids), function(i) {
+      df_block <- df_seq[as.integer(df_seq$VC_count) == vc_ids[i], ]
+      extract_nyquist_arc(pick_mid_row(df_block), sweep_freqs_hz) |>
+        dplyr::mutate(
+          snapshot_label = as.character(vc_ids[i]),
+          curve_position = (i - 1L) / max(length(vc_ids) - 1L, 1L)
+        )
+    })
+  } else if (seq_name == "EX_DYN") {
+    vc_ids_present <- sort(unique(as.integer(df_seq$VC_count)))
+    rep_ids <- ex_dyn_target_reps[ex_dyn_target_reps %in% vc_ids_present]
+    if (length(rep_ids) == 0L) {
+      rep_ids <- vc_ids_present[round(seq(1, length(vc_ids_present), length.out = 5))]
+    }
+    lapply(seq_along(rep_ids), function(i) {
+      df_block <- df_seq[as.integer(df_seq$VC_count) == rep_ids[i], ]
+      extract_nyquist_arc(pick_mid_row(df_block), sweep_freqs_hz) |>
+        dplyr::mutate(
+          snapshot_label = paste0("#", rep_ids[i]),
+          curve_position = (i - 1L) / max(length(rep_ids) - 1L, 1L)
+        )
+    })
+  } else {
+    n_rows   <- nrow(df_seq)
+    row_idxs <- round(seq(1, n_rows, length.out = 5))
+    lapply(seq_along(row_idxs), function(i) {
+      extract_nyquist_arc(df_seq[row_idxs[i], ], sweep_freqs_hz) |>
+        dplyr::mutate(
+          snapshot_label = ex_sta_time_labels[i],
+          curve_position = (i - 1L) / 4L
+        )
+    })
+  }
+
+  dplyr::bind_rows(curves) |> dplyr::mutate(panel_seq = seq_name)
+})) |>
+  dplyr::mutate(panel_seq = factor(.data$panel_seq, levels = nyquist_panel_seqs))
+
+bia_nyquist_plot <- ggplot(
+  nyquist_data,
+  aes(x = .data$R, y = .data$minus_Xc, group = .data$snapshot_label, colour = .data$curve_position)
+) +
+  geom_path(linewidth = 1.2) +
+  facet_wrap(~ panel_seq, scales = "free", ncol = 3) +
+  scale_colour_viridis_c(
+    name = NULL,
+    option = "plasma",
+    breaks = c(0, 1),
+    labels = c("fresh", "late")
+  ) +
+  labs(
+    title    = paste0("BIA 4PT Nyquist - ", RUN_ID),
+    subtitle = "Each arc: R vs -Xc across full sweep (4.9-122 kHz). Colour: temporal position in sequence.",
+    x        = "Resistance R (Ohm)",
+    y        = "-Reactance -Xc (Ohm)"
+  ) +
+  theme_amstrom_hgrid +
+  theme(aspect.ratio = 1)
+
+plot_export_map[["nyquist"]] <- bia_nyquist_plot
+```
+
+```{r show_main_plots, fig.width=11, fig.height=8}
+if (SHOW_MAIN_PLOT_GALLERY) {
+  for (plot_name in names(plot_export_map)) {
+    print(plot_export_map[[plot_name]])
+  }
+}
+```
+
+```{r export_bia_plots, message=FALSE}
+if (isTRUE(EXPORT_BIA_PLOTS)) {
+  qc_bia_export_path <- here::here("results", "QC_EXPORT", "bia_individual_analysis",
+    paste0(RUN_ID, "_bia_qc.pdf")
+  )
+  dir.create(dirname(qc_bia_export_path), recursive = TRUE, showWarnings = FALSE)
+
+  grDevices::pdf(file = qc_bia_export_path, width = 11, height = 8, onefile = TRUE)
+  for (plot_name in names(plot_export_map)) {
+    print(plot_export_map[[plot_name]])
+  }
+  grDevices::dev.off()
+
+  message("\n[BIA QC EXPORT] PDF -> ", normalizePath(qc_bia_export_path, winslash = "/", mustWork = FALSE))
+}
+```
+
+# 10. Export analysis tables
+
+```{r export_analysis_tables, message=FALSE}
+EXPORT_BIA_REFERENCE_FEATURES <- TRUE
+EXPORT_BIA_EX_DYN_FEATURES <- TRUE
+EXPORT_BIA_EX_STA_FEATURES <- TRUE
+EXPORT_BIA_RUN_SUMMARY <- TRUE
+EXPORT_BIA_COLE_FEATURES <- TRUE
+
+analysis_export_flags <- c(
+  bia_reference_features = EXPORT_BIA_REFERENCE_FEATURES,
+  bia_ex_dyn_features = EXPORT_BIA_EX_DYN_FEATURES,
+  bia_ex_sta_features = EXPORT_BIA_EX_STA_FEATURES,
+  bia_run_summary = EXPORT_BIA_RUN_SUMMARY,
+  bia_cole_reference = EXPORT_BIA_COLE_FEATURES,
+  bia_cole_ex_dyn = EXPORT_BIA_COLE_FEATURES,
+  bia_cole_ex_sta = EXPORT_BIA_COLE_FEATURES
+)
+
+analysis_export_map <- list(
+  bia_reference_features = reference_checkpoint_feature_table,
+  bia_ex_dyn_features = bia_ex_dyn_feature_table,
+  bia_ex_sta_features = bia_ex_sta_feature_table,
+  bia_run_summary = bia_run_summary_table,
+  bia_cole_reference = cole_reference_table,
+  bia_cole_ex_dyn = cole_ex_dyn_table,
+  bia_cole_ex_sta = cole_ex_sta_table
+)
+
+analysis_export_file_map <- c(
+  bia_reference_features = "bia_reference_feature_table.parquet",
+  bia_ex_dyn_features = "bia_ex_dyn_feature_table.parquet",
+  bia_ex_sta_features = "bia_ex_sta_feature_table.parquet",
+  bia_run_summary = "bia_run_summary_table.parquet",
+  bia_cole_reference = "bia_cole_reference_table.parquet",
+  bia_cole_ex_dyn = "bia_cole_ex_dyn_table.parquet",
+  bia_cole_ex_sta = "bia_cole_ex_sta_table.parquet"
+)
+
+if (isTRUE(EXPORT_ANALYSIS_TABLES)) {
+  selected_table_names <- names(analysis_export_flags)[analysis_export_flags]
+  if (length(selected_table_names) == 0L) {
+    stop("EXPORT_ANALYSIS_TABLES=TRUE but no BIA analysis table selector is set to TRUE.")
+  }
+
+  analysis_export_root <- here::here("results", "R_ANALYSIS", RUN_ID)
+  dir.create(analysis_export_root, recursive = TRUE, showWarnings = FALSE)
+
+  for (table_name in selected_table_names) {
+    arrow::write_parquet(
+      analysis_export_map[[table_name]],
+      sink = file.path(analysis_export_root, analysis_export_file_map[[table_name]])
+    )
+  }
+
+  message("\n[R ANALYSIS EXPORT] BIA tables -> ", normalizePath(analysis_export_root, winslash = "/", mustWork = FALSE))
+}
+```

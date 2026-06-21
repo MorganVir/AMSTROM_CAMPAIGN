@@ -1,0 +1,423 @@
+---
+title: "NIRS Cohort Analysis"
+author: "Morgan Virolan"
+date: "2026-05-16"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+---
+
+# Overview
+
+Cohort NIRS analysis: pool per-run feature tables and plot ΔHHb reference, EX_DYN, and EX_STA summaries.
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(glue)
+
+options(dplyr.summarise.inform = FALSE)
+source(here::here("sources", "R", "config", "amstrom_style.R"))
+source(here::here("sources", "R", "config", "cohort_config.R"))
+```
+
+```{r controls}
+# Paths + the shared EX_STA truncation length and the summary-table print switch.
+export_root          <- here::here("results", "DATA_EXPORT")
+subset_registry_path <- here::here("results", "R_ANALYSIS", "subset_registry", "multimodal_subset_registry.parquet"
+)
+
+# Shared cross-modal EX_STA duration from R/config/cohort_config.R (torque-based, 10% drop threshold).
+STA_N_MIN <- GLOBAL_STA_N_MIN
+PRINT_SUMMARY_TABLES <- FALSE
+```
+
+```{r load_registry}
+# All four cohort notebooks pool from cohort_final (four-way intersection minus excluded runs).
+# See R/config/cohort_config.R for exclusion lists. N is printed below after filtering.
+subset_registry <- arrow::read_parquet(subset_registry_path)
+
+nirs_run_ids <- subset_registry |>
+  dplyr::filter(.data$analysis_block == "cohort_final", .data$included == 1L) |>
+  dplyr::pull(.data$RUN_ID) |>
+  sort()
+
+cat("Cohort N (cohort_final):", length(nirs_run_ids), "\n")
+print(nirs_run_ids)
+```
+
+```{r pool_tables}
+# pool_nirs_table: read one per-run NIRS export for every cohort run and stack them into a
+# single table. Warns (does not stop) on a missing file. Called once per feature table below.
+pool_nirs_table <- function(run_ids, filename) {
+  paths  <- file.path(export_root, run_ids, filename)
+  exists <- file.exists(paths)
+  if (any(!exists)) {
+    warning(glue(
+      "Missing {sum(!exists)} parquet(s) for {filename}: ",
+      paste(run_ids[!exists], collapse = ", ")
+    ))
+  }
+  return(dplyr::bind_rows(lapply(paths[exists], arrow::read_parquet)))
+}
+
+nirs_ref_pooled     <- pool_nirs_table(nirs_run_ids, "nirs_reference_feature_table.parquet")
+nirs_ex_dyn_pooled  <- pool_nirs_table(nirs_run_ids, "nirs_ex_dyn_feature_table.parquet")
+nirs_ex_sta_pooled  <- pool_nirs_table(nirs_run_ids, "nirs_ex_sta_feature_table.parquet")
+nirs_summary_pooled <- pool_nirs_table(nirs_run_ids, "nirs_run_summary_table.parquet")
+
+cat("Pooled runs - ref:",     dplyr::n_distinct(nirs_ref_pooled$RUN_ID),
+    "| ex_dyn:", dplyr::n_distinct(nirs_ex_dyn_pooled$RUN_ID),
+    "| ex_sta:", dplyr::n_distinct(nirs_ex_sta_pooled$RUN_ID), "\n")
+```
+
+# 2. Reference
+
+Cohort mean ΔHHb (from the fresh global baseline) at each reference/checkpoint state. Error
+bars are mean ± SD across runs.
+
+```{r ref_checkpoint_plot, fig.width=7, fig.height=4}
+# Summarise to cohort mean/SD ΔHHb per reference state, then plot.
+ref_levels <- c("SVC_30%", "SVC_50%", "SVC_70%", "MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+
+ref_summary <- nirs_ref_pooled |>
+  dplyr::filter(.data$state_label %in% ref_levels) |>
+  dplyr::mutate(state_label = factor(.data$state_label, levels = ref_levels)) |>
+  dplyr::group_by(.data$state_label) |>
+  dplyr::summarise(
+    mean_hhb = mean(.data$hhb_from_baseline_umol, na.rm = TRUE),  # cohort mean ΔHHb (from fresh baseline)
+    sd_hhb   = sd(.data$hhb_from_baseline_umol, na.rm = TRUE),    # between-run SD
+    n        = dplyr::n_distinct(.data$RUN_ID),                  # runs at this state
+    .groups  = "drop"
+  )
+
+nirs_ref_plot <- ggplot(ref_summary, aes(x = .data$state_label, y = .data$mean_hhb, group = 1)) +
+  geom_errorbar(
+    aes(ymin = mean_hhb - sd_hhb, ymax = mean_hhb + sd_hhb),
+    width = 0, colour = col_nirs, linewidth = 0.4, alpha = 0.28
+  ) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_nirs) +
+  geom_point(shape = 15, size = 2.2, colour = col_nirs) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # zero = no change from baseline
+  labs(
+    title    = "NIRS - Reference (cohort mean +/- SD)",
+    subtitle = glue("N = {max(ref_summary$n)} runs"),
+    x        = NULL,
+    y        = "delta HHb from baseline (umol/L)"
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(nirs_ref_plot)
+```
+
+# 3. EX_DYN trajectories
+
+Cohort mean per repetition (ΔHHb from sequence rest), then the per-cycle features (desat /
+reoxy / onset slope) pooled across runs. Each chunk = one summarise + one plot; error bars
+are mean ± SD.
+
+```{r ex_dyn_hhb_plot, fig.width=7, fig.height=4}
+# Cohort mean/SD ΔHHb (from sequence rest) per repetition, then the trajectory plot.
+ex_dyn_summary <- nirs_ex_dyn_pooled |>
+  dplyr::group_by(.data$VC_count) |>
+  dplyr::summarise(
+    mean_hhb = mean(.data$hhb_from_seq_rest_umol, na.rm = TRUE),  # cohort mean ΔHHb (from seq rest)
+    sd_hhb   = sd(.data$hhb_from_seq_rest_umol, na.rm = TRUE),    # between-run SD
+    n        = dplyr::n(),                                       # rows pooled at this point
+    .groups  = "drop"
+  )
+
+nirs_ex_dyn_plot <- ggplot(ex_dyn_summary, aes(x = .data$VC_count, y = .data$mean_hhb)) +
+  geom_errorbar(
+    aes(ymin = mean_hhb - sd_hhb, ymax = mean_hhb + sd_hhb),
+    width = 0, colour = col_nirs, linewidth = 0.4, alpha = 0.28
+  ) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_nirs) +
+  geom_point(shape = 15, size = 2.2, colour = col_nirs) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # zero = no change from baseline
+  labs(
+    title    = "EX_DYN - delta HHb from seq. rest (cohort mean +/- SD)",
+    subtitle = glue("N = {max(ex_dyn_summary$n)} runs"),
+    x        = "Repetition",
+    y        = "delta HHb from seq. rest (umol/L)"
+  ) +
+  theme_amstrom_hgrid
+
+print(nirs_ex_dyn_plot)
+```
+
+```{r ex_dyn_features_plot, fig.width=7, fig.height=7}
+# Per-cycle features (desat / reoxy / onset slope): pivot long, cohort mean/SD per rep, facet.
+feature_labels <- c(
+  hhb_desat_umol   = "Desat amplitude (umol/L)",
+  hhb_sat_umol     = "Reoxy amplitude (umol/L)",
+  hhb_slope_umol_s = "Onset slope (umol/L/s)"
+)
+
+ex_dyn_features_summary <- nirs_ex_dyn_pooled |>
+  tidyr::pivot_longer(
+    cols      = c("hhb_desat_umol", "hhb_sat_umol", "hhb_slope_umol_s"),
+    names_to  = "feature",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(
+    feature = factor(.data$feature, levels = names(feature_labels), labels = unname(feature_labels))
+  ) |>
+  dplyr::group_by(.data$feature, .data$VC_count) |>
+  dplyr::summarise(
+    mean_val = mean(.data$value, na.rm = TRUE),  # cohort mean of this feature at this rep
+    sd_val   = sd(.data$value, na.rm = TRUE),    # between-run SD
+    .groups  = "drop"
+  )
+
+nirs_ex_dyn_features_plot <- ggplot(
+  ex_dyn_features_summary,
+  aes(x = .data$VC_count, y = .data$mean_val)
+) +
+  geom_errorbar(
+    aes(ymin = mean_val - sd_val, ymax = mean_val + sd_val),
+    width = 0, colour = col_nirs, linewidth = 0.4, alpha = 0.28
+  ) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_nirs) +
+  geom_point(shape = 15, size = 2.2, colour = col_nirs) +
+  facet_wrap(~ feature, ncol = 1, scales = "free_y") +
+  labs(
+    title = "EX_DYN - per-cycle NIRS features (cohort mean +/- SD)",
+    x     = "Repetition",
+    y     = NULL
+  ) +
+  theme_amstrom_hgrid
+
+print(nirs_ex_dyn_features_plot)
+```
+
+# 4. EX_STA trajectories
+
+All runs truncated to the shared window count (`STA_N_MIN`), then cohort mean ΔHHb per 1 s
+window. The first chunk just inspects per-run window counts before truncating.
+
+```{r ex_sta_inspect_n_min}
+# Inspect per-run EX_STA length (max window_index) before truncating to the shared minimum.
+run_window_maxima <- nirs_ex_sta_pooled |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::summarise(max_window_index = max(.data$window_index, na.rm = TRUE), .groups = "drop") |>
+  dplyr::arrange(.data$max_window_index)
+
+cat("Per-run EX_STA window_index maxima:\n")
+print(run_window_maxima, n = Inf)
+cat("\nSTA_N_MIN (GLOBAL_STA_N_MIN from cohort_config.R):", STA_N_MIN, "\n")
+```
+
+```{r ex_sta_harmonize}
+# All runs, truncated at STA_N_MIN.
+sta_label <- glue("All participants (N = {length(nirs_run_ids)})")
+
+ex_sta <- nirs_ex_sta_pooled |>
+  dplyr::filter(.data$window_index <= STA_N_MIN)
+
+cat(sta_label, "| truncated at window_index <=", STA_N_MIN, "\n")
+```
+
+```{r ex_sta_plot, fig.width=6, fig.height=4}
+# Cohort mean/SD ΔHHb per 1 s window, then the trajectory plot.
+ex_sta_summary <- ex_sta |>
+  dplyr::group_by(.data$window_index) |>
+  dplyr::summarise(
+    mean_hhb = mean(.data$hhb_from_seq_rest_umol, na.rm = TRUE),  # cohort mean ΔHHb (from seq rest)
+    sd_hhb   = sd(.data$hhb_from_seq_rest_umol, na.rm = TRUE),    # between-run SD
+    n        = dplyr::n(),                                       # rows pooled at this point
+    .groups  = "drop"
+  )
+
+nirs_ex_sta_plot <- ggplot(ex_sta_summary, aes(x = .data$window_index, y = .data$mean_hhb)) +
+  geom_errorbar(
+    aes(ymin = mean_hhb - sd_hhb, ymax = mean_hhb + sd_hhb),
+    width = 0, colour = col_nirs, linewidth = 0.4, alpha = 0.28
+  ) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_nirs) +
+  geom_point(shape = 15, size = 2.2, colour = col_nirs) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # zero = no change from baseline
+  labs(
+    title    = "EX_STA - delta HHb from seq. rest (cohort mean +/- SD)",
+    subtitle = sta_label,
+    x        = "Window index (1 s)",
+    y        = "delta HHb from seq. rest (umol/L)"
+  ) +
+  theme_amstrom_hgrid
+
+print(nirs_ex_sta_plot)
+```
+
+# 5. Run-level summary
+
+One value per run (linear slope over time, and last-minus-first delta), shown as individual
+points plus the cohort mean. Slope and last-minus-first are drawn in separate plots because
+their y-scales are incompatible (µmol/L per step vs µmol/L).
+
+```{r run_summary_plot, fig.width=9, fig.height=6}
+# Split the per-run summary metrics into slope vs last-minus-first (different y-scales), then
+# draw each as jittered per-run points with the cohort mean marked.
+summary_plot_df <- nirs_summary_pooled |>
+  dplyr::filter(is.finite(.data$summary_value)) |>
+  dplyr::mutate(
+    panel_label = paste0(.data$summary_variable, "\n[", .data$source_sequence, "]"),
+    type_label  = dplyr::case_match(
+      .data$summary_type,
+      c("VC_count_linear_slope", "window_index_linear_slope") ~ "Linear slope",
+      "last_minus_first"                                       ~ "Last - first",
+      .default = .data$summary_type
+    )
+  )
+
+# Slope and last_minus_first have incompatible y-axis scales (µmol/L/rep vs µmol/L),
+# so they are shown in separate plots rather than the same facet panel.
+
+slope_df <- summary_plot_df |> dplyr::filter(.data$type_label == "Linear slope")
+delta_df <- summary_plot_df |> dplyr::filter(.data$type_label == "Last - first")
+
+nirs_slope_plot <- ggplot(slope_df, aes(x = "", y = .data$summary_value)) +
+  geom_jitter(width = 0.15, height = 0, shape = 1, size = 2, alpha = 0.75, colour = col_nirs) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3.5, colour = col_nirs) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # zero = no change from baseline
+  facet_wrap(~ panel_label, scales = "free_y", ncol = 3) +
+  labs(
+    title = "NIRS - Linear slope per run (individual runs + cohort mean)",
+    x     = NULL,
+    y     = "µmol/L per repetition (or per window)"
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+# Last - first: delta HHb from the first to the last window of each sequence.
+# Analogous to Song et al. 2025 (1273) phase-1 to phase-5 total excursion — total
+# net deoxygenation change across the exercise bout.
+nirs_delta_plot <- ggplot(delta_df, aes(x = "", y = .data$summary_value)) +
+  geom_jitter(width = 0.15, height = 0, shape = 1, size = 2, alpha = 0.75, colour = col_expected) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3.5, colour = col_expected) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # zero = no change from baseline
+  facet_wrap(~ panel_label, scales = "free_y", ncol = 3) +
+  labs(
+    title    = "NIRS - Last - first delta per run (individual runs + cohort mean)",
+    subtitle = "Analogous to Song et al. 2025 phase-1 to phase-5 total excursion",
+    x        = NULL,
+    y        = "delta HHb (µmol/L)"
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+print(nirs_slope_plot)
+print(nirs_delta_plot)
+```
+
+```{r run_summary_table}
+# Per-run wide summary: EX_DYN/EX_STA mean ΔHHb + slope + last-minus-first, one row per run.
+per_run_dyn_mean <- nirs_ex_dyn_pooled |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::summarise(
+    exdyn_mean = round(mean(.data$hhb_from_seq_rest_umol, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+per_run_sta_mean <- nirs_ex_sta_pooled |>
+  dplyr::filter(.data$window_index <= STA_N_MIN) |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::summarise(
+    exsta_mean = round(mean(.data$hhb_from_seq_rest_umol, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+summary_wide <- nirs_summary_pooled |>
+  dplyr::filter(
+    .data$summary_variable == "hhb_from_seq_rest_umol",
+    .data$analysis_block   %in% c("nirs_ex_dyn", "nirs_ex_sta")
+  ) |>
+  dplyr::mutate(col_name = dplyr::case_when(
+    analysis_block == "nirs_ex_dyn" & summary_type == "VC_count_linear_slope"    ~ "exdyn_slope",
+    analysis_block == "nirs_ex_dyn" & summary_type == "last_minus_first"          ~ "exdyn_lmf",
+    analysis_block == "nirs_ex_sta" & summary_type == "window_index_linear_slope" ~ "exsta_slope",
+    analysis_block == "nirs_ex_sta" & summary_type == "last_minus_first"          ~ "exsta_lmf"
+  )) |>
+  dplyr::filter(!is.na(.data$col_name)) |>
+  tidyr::pivot_wider(id_cols = "RUN_ID", names_from = "col_name", values_from = "summary_value") |>
+  dplyr::mutate(dplyr::across(-RUN_ID, \(x) round(x, 2)))
+
+per_run_dyn_mean |>
+  dplyr::left_join(per_run_sta_mean, by = "RUN_ID") |>
+  dplyr::left_join(summary_wide,     by = "RUN_ID") |>
+  dplyr::arrange(.data$exdyn_mean) |>
+  knitr::kable(
+    col.names = c("Run", "EX_DYN mean", "EX_STA mean",
+                  "EX_DYN slope", "EX_DYN last-first",
+                  "EX_STA slope", "EX_STA last-first"),
+    caption = "Per-run delta HHb from seq. rest (µmol/L). Sorted by EX_DYN mean. Slope = µmol/L per rep or window."
+  )
+```
+
+# 6. Summary tables
+
+Set `PRINT_SUMMARY_TABLES <- TRUE` in §1 controls to render these.
+
+## Reference checkpoints
+
+```{r summary_ref, eval = PRINT_SUMMARY_TABLES}
+# Summary table: reference ΔHHb per state (cohort mean +/- SD).
+ref_summary |>
+  dplyr::mutate(dplyr::across(c(mean_hhb, sd_hhb), ~round(.x, 2))) |>
+  knitr::kable(
+    col.names = c("State", "Mean HHb (µmol/L)", "SD", "N runs"),
+    caption   = "Reference sequences - delta HHb from per-sequence baseline."
+  )
+```
+
+## EX_DYN trajectory (5 representative reps)
+
+```{r summary_ex_dyn, eval = PRINT_SUMMARY_TABLES}
+# Summary table: ΔHHb at 5 evenly-spaced EX_DYN reps.
+idx_dyn <- round(seq(1, nrow(ex_dyn_summary), length.out = min(5L, nrow(ex_dyn_summary))))
+ex_dyn_summary[idx_dyn, ] |>
+  dplyr::mutate(dplyr::across(c(mean_hhb, sd_hhb), ~round(.x, 2))) |>
+  knitr::kable(
+    col.names = c("Rep", "Mean HHb (µmol/L)", "SD", "N"),
+    caption   = "EX_DYN delta HHb - 5 evenly-spaced reps (cohort mean +/- SD)."
+  )
+```
+
+## EX_STA trajectory (5 representative windows)
+
+```{r summary_ex_sta, eval = PRINT_SUMMARY_TABLES}
+# Summary table: ΔHHb at 5 evenly-spaced EX_STA windows.
+idx_sta <- round(seq(1, nrow(ex_sta_summary), length.out = min(5L, nrow(ex_sta_summary))))
+ex_sta_summary[idx_sta, ] |>
+  dplyr::mutate(dplyr::across(c(mean_hhb, sd_hhb), ~round(.x, 2))) |>
+  knitr::kable(
+    col.names = c("Window", "Mean HHb (µmol/L)", "SD", "N"),
+    caption   = paste0("EX_STA delta HHb - 5 evenly-spaced windows (all runs, truncated at ", STA_N_MIN, ").")
+  )
+```
+
+## Run-level summary
+
+```{r summary_runs, eval = PRINT_SUMMARY_TABLES}
+# Summary table: every per-run NIRS metric (slopes + last-minus-first deltas), long format.
+nirs_summary_pooled |>
+  dplyr::filter(is.finite(.data$summary_value)) |>
+  dplyr::mutate(summary_value = round(.data$summary_value, 4)) |>
+  dplyr::select(RUN_ID, source_sequence, summary_variable, summary_type, summary_value) |>
+  dplyr::arrange(.data$source_sequence, .data$summary_variable, .data$RUN_ID) |>
+  knitr::kable(
+    col.names = c("Run", "Sequence", "Variable", "Type", "Value"),
+    caption   = "Per-run NIRS summary metrics (slopes and last-minus-first deltas)."
+  )
+``` 

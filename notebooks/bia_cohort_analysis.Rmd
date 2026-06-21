@@ -1,0 +1,669 @@
+---
+title: "AMSTROM BIA Cohort Analysis"
+author: "Morgan Virolan"
+date: "2026-05-16"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+---
+
+# Overview
+
+Cohort BIA/EIM analysis: pool run-level exports, harmonize EX_STA duration, plot RelDev/Cole trajectories, and optionally write cohort tables.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+options(dplyr.summarise.inform = FALSE)
+source(here::here("sources", "R", "config", "amstrom_style.R"))
+source(here::here("sources", "R", "config", "cohort_config.R"))
+
+freq_levels <- c("9.76 kHz", "48.8 kHz", "97.6 kHz")
+PRINT_SUMMARY_TABLES <- FALSE
+
+# Colour per frequency (reference/checkpoint plot)
+bia_freq_pal <- c(
+  "9.76 kHz" = "#b5a0cc",
+  "48.8 kHz" = "#7b5ea7",
+  "97.6 kHz" = "#4a2e7f"
+)
+```
+
+---
+
+# 2. Discover cohort input runs
+
+Runs are pooled from the shared `cohort_final` block so all cohort notebooks use the same sample.
+
+```{r discover_paths}
+analysis_root        <- here::here("results", "R_ANALYSIS")
+export_root          <- here::here("results", "DATA_EXPORT")
+cohort_output_root   <- file.path(analysis_root, "cohort")
+subset_registry_path <- file.path(analysis_root, "subset_registry",
+                                   "multimodal_subset_registry.parquet")
+```
+
+```{r discover_run_ids}
+if (!file.exists(subset_registry_path)) {
+  stop(
+    "Subset registry not found: ",
+    normalizePath(subset_registry_path, winslash = "/", mustWork = FALSE),
+    "\nRun multimodal_subset_checker.R first."
+  )
+}
+
+subset_registry <- arrow::read_parquet(subset_registry_path)
+
+run_ids <- subset_registry |>
+  dplyr::filter(.data$analysis_block == "cohort_final", .data$included == 1L) |>
+  dplyr::pull(.data$RUN_ID) |>
+  sort()
+
+if (length(run_ids) == 0L) {
+  stop("No runs in cohort_final. Re-run multimodal_subset_checker.R.")
+}
+
+cat("Cohort N (cohort_final):", length(run_ids), "\n")
+run_ids
+```
+
+---
+
+# 3. Pool run-level BIA tables
+
+Read each run's BIA exports and stack into pooled tables. Only the three analysis frequencies
+(9.76 / 48.8 / 97.6 kHz) are kept, and 9.76 kHz Xc/PhA are dropped here and at §4 (inductive
+artifact -> see the §4 comment).
+
+```{r pool_bia_tables}
+# read_bia_table: read one per-run BIA export, erroring if a file is missing.
+read_bia_table <- function(run_id, file_name) {
+  path <- file.path(analysis_root, run_id, file_name)
+  if (!file.exists(path)) {
+    stop("Missing BIA file: ", normalizePath(path, winslash = "/", mustWork = FALSE))
+  }
+  return(arrow::read_parquet(path))
+}
+
+cohort_bia_reference_feature_table <- dplyr::bind_rows(
+  lapply(run_ids, function(r) read_bia_table(r, "bia_reference_feature_table.parquet"))
+) |>
+  dplyr::filter(.data$freq_hz %in% c(9760L, 48800L, 97600L)) |>
+  dplyr::mutate(freq_label = factor(.data$freq_label, levels = freq_levels)) |>
+  dplyr::arrange(.data$RUN_ID, .data$summary_variable, .data$freq_hz, .data$state_label)
+
+cohort_bia_ex_dyn_feature_table <- dplyr::bind_rows(
+  lapply(run_ids, function(r) read_bia_table(r, "bia_ex_dyn_feature_table.parquet"))
+) |>
+  dplyr::filter(.data$freq_hz %in% c(9760L, 48800L, 97600L)) |>
+  dplyr::mutate(freq_label = factor(.data$freq_label, levels = freq_levels)) |>
+  dplyr::arrange(.data$RUN_ID, .data$summary_variable, .data$freq_hz, .data$VC_count) |>
+  # 9.76 kHz Xc and PhA excluded — same inductive-parasitic artifact as EX_STA (see §4).
+  dplyr::filter(!(.data$freq_hz == 9760L & .data$summary_variable %in% c("Xc", "PhA")))
+
+cohort_bia_ex_sta_feature_table_raw <- dplyr::bind_rows(
+  lapply(run_ids, function(r) read_bia_table(r, "bia_ex_sta_feature_table.parquet"))
+) |>
+  dplyr::filter(.data$freq_hz %in% c(9760L, 48800L, 97600L)) |>
+  dplyr::mutate(freq_label = factor(.data$freq_label, levels = freq_levels)) |>
+  dplyr::arrange(.data$RUN_ID, .data$summary_variable, .data$freq_hz, .data$window_index)
+
+cohort_bia_run_summary_table <- dplyr::bind_rows(
+  lapply(run_ids, function(r) read_bia_table(r, "bia_run_summary_table.parquet"))
+) |>
+  dplyr::arrange(.data$analysis_block, .data$summary_variable, .data$freq_hz, .data$RUN_ID)
+```
+
+---
+
+# 4. EX_STA common-duration harmonization
+
+EX_STA is truncated to `GLOBAL_STA_N_MIN` so all modalities share the same window count.
+
+```{r harmonize_ex_sta_common_duration}
+cohort_bia_ex_sta_run_profile <- cohort_bia_ex_sta_feature_table_raw |>
+  dplyr::group_by(.data$RUN_ID) |>
+  dplyr::summarise(last_window_index = max(.data$window_index, na.rm = TRUE),  # per-run EX_STA length
+                   .groups = "drop")
+
+sta_n_min <- GLOBAL_STA_N_MIN
+
+cohort_bia_ex_sta_feature_table <- cohort_bia_ex_sta_feature_table_raw |>
+  dplyr::filter(.data$window_index <= sta_n_min) |>
+  # 9.76 kHz Xc and PhA excluded: same inductive-parasitic artifact that caused 4880 Hz
+  # to be dropped in Cole fitting. At 9.76 kHz, tissue Xc is near the measurement noise
+  # floor for most subjects (Cole arc far below fc ~75 kHz). Inductive artifact contaminates
+  # the near-zero Xc, producing RelDev denominators close to zero and swings up to ±6724%.
+  # R and absZ at 9.76 kHz are unaffected (resistance >> artifact). See article methods.
+  dplyr::filter(!(.data$freq_hz == 9760L & .data$summary_variable %in% c("Xc", "PhA")))
+
+cohort_bia_ex_sta_run_profile
+cat("Truncating EX_STA to", sta_n_min, "windows (GLOBAL_STA_N_MIN from cohort_config.R).\n")
+cat("9.76 kHz Xc and PhA excluded (inductive artifact — see comment above).\n")
+```
+
+---
+
+# 5. Optional cohort export
+
+Writes the pooled tables to `results/R_ANALYSIS/cohort/` when `EXPORT_COHORT_PARQUET` is TRUE.
+Off by default -- the analysis below runs from the in-memory pools regardless.
+
+```{r cohort_export_control}
+EXPORT_COHORT_PARQUET <- FALSE
+
+if (isTRUE(EXPORT_COHORT_PARQUET)) {
+  dir.create(cohort_output_root, recursive = TRUE, showWarnings = FALSE)
+  arrow::write_parquet(cohort_bia_reference_feature_table,
+    sink = file.path(cohort_output_root, "cohort_bia_reference_feature_table.parquet"))
+  arrow::write_parquet(cohort_bia_ex_dyn_feature_table,
+    sink = file.path(cohort_output_root, "cohort_bia_ex_dyn_feature_table.parquet"))
+  arrow::write_parquet(cohort_bia_ex_sta_feature_table,
+    sink = file.path(cohort_output_root, "cohort_bia_ex_sta_feature_table.parquet"))
+  arrow::write_parquet(cohort_bia_run_summary_table,
+    sink = file.path(cohort_output_root, "cohort_bia_run_summary_table.parquet"))
+}
+```
+
+---
+
+# 6. Cole model — spectral structure
+
+Cole arcs are reconstructed only over the measured range (9.76–122 kHz); `R_inf` and high `fc_hz` fits remain extrapolation-sensitive.
+
+## 6.1 Pool and harmonize
+
+Pool the three per-run Cole tables (reference / EX_DYN / EX_STA); EX_STA is truncated to
+`GLOBAL_STA_N_MIN` to match the other modalities.
+
+```{r pool_cole_tables}
+cole_params <- c("R_inf", "delta_R", "R0", "fc_hz", "alpha")
+
+cohort_cole_reference_table <- dplyr::bind_rows(
+  lapply(run_ids, function(r) read_bia_table(r, "bia_cole_reference_table.parquet"))
+) |>
+  dplyr::arrange(.data$RUN_ID, .data$source_sequence)
+
+cohort_cole_ex_dyn_table <- dplyr::bind_rows(
+  lapply(run_ids, function(r) read_bia_table(r, "bia_cole_ex_dyn_table.parquet"))
+) |>
+  dplyr::arrange(.data$RUN_ID, .data$VC_count)
+
+cohort_cole_ex_sta_table <- dplyr::bind_rows(
+  lapply(run_ids, function(r) read_bia_table(r, "bia_cole_ex_sta_table.parquet"))
+) |>
+  dplyr::filter(.data$window_index <= GLOBAL_STA_N_MIN) |>
+  dplyr::arrange(.data$RUN_ID, .data$window_index)
+```
+
+## 6.2 Nyquist arc plot
+
+```{r cole_nyquist, fig.width=10, fig.height=4}
+# Reconstruct Cole arc from parameters over a frequency sweep
+reconstruct_arc <- function(R_inf, delta_R, fc_hz, alpha, n_pts = 400) {
+  # Use actual measurement range only — fc is often above 122 kHz so arcs are partial
+  freqs <- 10^seq(log10(9760), log10(122000), length.out = n_pts)
+  z     <- R_inf + delta_R / (1 + (1i * freqs / fc_hz)^alpha)
+  return(data.frame(cole_R = Re(z), cole_negXc = -Im(z)))
+}
+
+# --- EX_DYN: mean arc at 4 equally-spaced reps ---
+mean_cole_ex_dyn <- cohort_cole_ex_dyn_table |>
+  dplyr::filter(!is.na(.data$R_inf)) |>
+  dplyr::group_by(.data$VC_count) |>
+  dplyr::summarise(
+    R_inf   = mean(.data$R_inf,   na.rm = TRUE),  # cohort mean R_inf [extrapolated]
+    delta_R = mean(.data$delta_R, na.rm = TRUE),  # cohort mean delta_R
+    fc_hz   = mean(.data$fc_hz,   na.rm = TRUE),  # cohort mean fc [extrapolated]
+    alpha   = mean(.data$alpha,   na.rm = TRUE),  # cohort mean alpha
+    .groups = "drop"
+  )
+
+all_vcs  <- sort(unique(mean_cole_ex_dyn$VC_count))
+sel_vcs  <- all_vcs[round(seq(1, length(all_vcs), length.out = 4))]
+
+ex_dyn_arcs <- dplyr::bind_rows(lapply(sel_vcs, function(vc) {
+  p <- mean_cole_ex_dyn[mean_cole_ex_dyn$VC_count == vc, ]
+  reconstruct_arc(p$R_inf, p$delta_R, p$fc_hz, p$alpha) |>
+    dplyr::mutate(label = paste0("Rep ", vc))
+})) |>
+  dplyr::mutate(label = factor(.data$label, levels = paste0("Rep ", sel_vcs)))
+
+# --- Reference sequences ---
+mean_cole_ref <- cohort_cole_reference_table |>
+  dplyr::filter(!is.na(.data$R_inf)) |>
+  dplyr::group_by(.data$source_sequence) |>
+  dplyr::summarise(
+    R_inf   = mean(.data$R_inf,   na.rm = TRUE),  # cohort mean R_inf [extrapolated]
+    delta_R = mean(.data$delta_R, na.rm = TRUE),  # cohort mean delta_R
+    fc_hz   = mean(.data$fc_hz,   na.rm = TRUE),  # cohort mean fc [extrapolated]
+    alpha   = mean(.data$alpha,   na.rm = TRUE),  # cohort mean alpha
+    .groups = "drop"
+  )
+
+ref_seq_levels <- c("SVC_REF", "MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+ref_seq_present <- intersect(ref_seq_levels, mean_cole_ref$source_sequence)
+
+ref_arcs <- dplyr::bind_rows(lapply(ref_seq_present, function(seq_name) {
+  p <- mean_cole_ref[mean_cole_ref$source_sequence == seq_name, ]
+  reconstruct_arc(p$R_inf, p$delta_R, p$fc_hz, p$alpha) |>
+    dplyr::mutate(label = seq_name)
+})) |>
+  dplyr::mutate(label = factor(.data$label, levels = ref_seq_present))
+
+# --- EX_STA ---
+mean_cole_ex_sta <- cohort_cole_ex_sta_table |>
+  dplyr::filter(!is.na(.data$R_inf)) |>
+  dplyr::group_by(.data$window_index) |>
+  dplyr::summarise(
+    R_inf   = mean(.data$R_inf,   na.rm = TRUE),  # cohort mean R_inf [extrapolated]
+    delta_R = mean(.data$delta_R, na.rm = TRUE),  # cohort mean delta_R
+    fc_hz   = mean(.data$fc_hz,   na.rm = TRUE),  # cohort mean fc [extrapolated]
+    alpha   = mean(.data$alpha,   na.rm = TRUE),  # cohort mean alpha
+    .groups = "drop"
+  )
+
+all_wins  <- sort(unique(mean_cole_ex_sta$window_index))
+sel_wins  <- all_wins[round(seq(1, length(all_wins), length.out = 4))]
+
+ex_sta_arcs <- dplyr::bind_rows(lapply(sel_wins, function(wi) {
+  p <- mean_cole_ex_sta[mean_cole_ex_sta$window_index == wi, ]
+  reconstruct_arc(p$R_inf, p$delta_R, p$fc_hz, p$alpha) |>
+    dplyr::mutate(label = paste0("Win ", wi))
+})) |>
+  dplyr::mutate(label = factor(.data$label, levels = paste0("Win ", sel_wins)))
+
+# --- Plots ---
+nyquist_theme <- theme_amstrom_hgrid +
+  theme(legend.position = "right")
+
+p_ref_nyq <- ggplot(ref_arcs, aes(x = .data$cole_R, y = .data$cole_negXc,
+                                    colour = .data$label)) +
+  geom_path(linewidth = 0.9) +
+  coord_fixed() +
+  scale_colour_viridis_d(option = "plasma", direction = -1, name = NULL) +
+  labs(title = "Cole Nyquist - reference sequences",
+       subtitle = "Arcs over 9.76-122 kHz. fc median ~75 kHz (most fits within window); ~10% of reps fc > 122 kHz.",
+       x = "R (Ohm)", y = "-Xc (Ohm)") +
+  nyquist_theme
+
+p_dyn_nyq <- ggplot(ex_dyn_arcs, aes(x = .data$cole_R, y = .data$cole_negXc,
+                                       colour = .data$label)) +
+  geom_path(linewidth = 0.9) +
+  coord_fixed() +
+  scale_colour_viridis_d(option = "plasma", direction = -1, name = NULL) +
+  labs(title = "Cole Nyquist - EX_DYN (dark = early, bright = late)",
+       subtitle = "Arcs over 9.76-122 kHz. fc median ~75 kHz (most fits within window); ~10% of reps fc > 122 kHz.",
+       x = "R (Ohm)", y = "-Xc (Ohm)") +
+  nyquist_theme
+
+p_sta_nyq <- ggplot(ex_sta_arcs, aes(x = .data$cole_R, y = .data$cole_negXc,
+                                       colour = .data$label)) +
+  geom_path(linewidth = 0.9) +
+  coord_fixed() +
+  scale_colour_viridis_d(option = "plasma", direction = -1, name = NULL) +
+  labs(title = "Cole Nyquist - EX_STA (dark = early, bright = late)",
+       subtitle = "Arcs over 9.76-122 kHz. fc median ~75 kHz (most fits within window); ~10% of reps fc > 122 kHz.",
+       x = "R (Ohm)", y = "-Xc (Ohm)") +
+  nyquist_theme
+
+print(p_ref_nyq)
+print(p_dyn_nyq)
+print(p_sta_nyq)
+```
+
+## 6.3 Cole parameter trajectories
+
+```{r cole_parameter_trajectories, fig.width=10, fig.height=10}
+# Cohort mean +/- SD per timepoint for each Cole parameter (the ribbon shows the SD band).
+# R_inf and fc carry an [extrapolated] tag in the labels.
+cole_param_labels <- c(
+  R_inf   = "R_inf (Ohm) [extrapolated]",
+  delta_R = "delta_R (Ohm)",
+  R0      = "R0 (Ohm)",
+  fc_hz   = "fc (Hz) [extrapolated]",
+  alpha   = "alpha"
+)
+
+# --- EX_DYN ---
+cole_ex_dyn_long <- cohort_cole_ex_dyn_table |>
+  dplyr::filter(!is.na(.data$R_inf)) |>
+  tidyr::pivot_longer(cols = all_of(cole_params), names_to = "parameter", values_to = "value") |>
+  dplyr::group_by(.data$VC_count, .data$parameter) |>
+  dplyr::summarise(
+    mean_value = mean(.data$value, na.rm = TRUE),  # cohort mean of this Cole parameter
+    sd_value   = sd(.data$value, na.rm = TRUE),    # between-run SD (drawn as the ribbon)
+    .groups    = "drop"
+  ) |>
+  dplyr::mutate(parameter = factor(.data$parameter, levels = cole_params))
+
+# --- EX_STA ---
+cole_ex_sta_long <- cohort_cole_ex_sta_table |>
+  dplyr::filter(!is.na(.data$R_inf)) |>
+  tidyr::pivot_longer(cols = all_of(cole_params), names_to = "parameter", values_to = "value") |>
+  dplyr::group_by(.data$window_index, .data$parameter) |>
+  dplyr::summarise(
+    mean_value = mean(.data$value, na.rm = TRUE),  # cohort mean of this Cole parameter
+    sd_value   = sd(.data$value, na.rm = TRUE),    # between-run SD (drawn as the ribbon)
+    .groups    = "drop"
+  ) |>
+  dplyr::mutate(parameter = factor(.data$parameter, levels = cole_params))
+
+p_cole_dyn <- ggplot(cole_ex_dyn_long,
+  aes(x = .data$VC_count, y = .data$mean_value)) +
+  geom_ribbon(aes(ymin = .data$mean_value - .data$sd_value,
+                  ymax = .data$mean_value + .data$sd_value),
+              fill = col_bia, alpha = 0.15) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_bia) +
+  geom_point(shape = 15, size = 2.2, colour = col_bia) +
+  facet_wrap(~ parameter, ncol = 2, scales = "free_y",
+             labeller = ggplot2::labeller(parameter = cole_param_labels)) +
+  labs(title = "Cole parameters - EX_DYN cohort mean",
+       subtitle = "R_inf and fc are extrapolated (fc typically 70-570 kHz, above 122 kHz ceiling)",
+       x = "Repetition", y = NULL, caption = "Ribbon = mean +/- SD") +
+  theme_amstrom_hgrid
+
+p_cole_sta <- ggplot(cole_ex_sta_long,
+  aes(x = .data$window_index, y = .data$mean_value)) +
+  geom_ribbon(aes(ymin = .data$mean_value - .data$sd_value,
+                  ymax = .data$mean_value + .data$sd_value),
+              fill = col_bia, alpha = 0.15) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_bia) +
+  geom_point(shape = 15, size = 2.2, colour = col_bia) +
+  facet_wrap(~ parameter, ncol = 2, scales = "free_y",
+             labeller = ggplot2::labeller(parameter = cole_param_labels)) +
+  labs(title = "Cole parameters - EX_STA cohort mean",
+       subtitle = "R_inf and fc are extrapolated (fc typically 70-570 kHz, above 122 kHz ceiling)",
+       x = "Window index", y = NULL, caption = "Ribbon = mean +/- SD") +
+  theme_amstrom_hgrid
+
+print(p_cole_dyn)
+print(p_cole_sta)
+```
+
+---
+
+# 7. BIA RelDev trajectories
+
+Cohort mean RelDev from the sequence-matched baseline.
+
+## 7.1 All variables — EX_DYN and EX_STA
+
+```{r bia_reldev_trajectories, fig.width=9, fig.height=7}
+# --- EX_DYN RelDev ---
+ex_dyn_reldev_mean <- cohort_bia_ex_dyn_feature_table |>
+  dplyr::group_by(.data$VC_count, .data$summary_variable, .data$freq_label) |>
+  dplyr::summarise(mean_reldev = mean(.data$reldev_pct, na.rm = TRUE), .groups = "drop")  # cohort mean RelDev from MVC_REF
+
+p_ex_dyn_reldev <- ggplot(
+  ex_dyn_reldev_mean,
+  aes(x = .data$VC_count, y = .data$mean_reldev,
+      colour = .data$freq_label, group = .data$freq_label)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+  geom_line(linewidth = 0.35) +
+  geom_point(shape = 15, size = 2.2) +
+  facet_wrap(~ summary_variable, ncol = 2, scales = "free_y") +
+  scale_colour_manual(values = bia_freq_pal, name = NULL) +
+  labs(
+    title   = "BIA EX_DYN - RelDev from MVC_REF",
+    x       = "Repetition",
+    y       = "RelDev (%)",
+    caption = "Cohort mean. Dashed line = 0% (MVC_REF level). Curves start below 0 due to SVC_REF pre-loading."
+  ) +
+  theme_amstrom_hgrid
+
+# --- EX_STA RelDev ---
+ex_sta_reldev_mean <- cohort_bia_ex_sta_feature_table |>
+  dplyr::group_by(.data$window_index, .data$summary_variable, .data$freq_label) |>
+  dplyr::summarise(mean_reldev = mean(.data$reldev_seq_pct, na.rm = TRUE), .groups = "drop")  # cohort mean within-sequence RelDev
+
+p_ex_sta_reldev <- ggplot(
+  ex_sta_reldev_mean,
+  aes(x = .data$window_index, y = .data$mean_reldev,
+      colour = .data$freq_label, group = .data$freq_label)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+  geom_line(linewidth = 0.35) +
+  geom_point(shape = 15, size = 2.2) +
+  facet_wrap(~ summary_variable, ncol = 2, scales = "free_y") +
+  scale_colour_manual(values = bia_freq_pal, name = NULL) +
+  labs(
+    title   = "BIA EX_STA - RelDev from sequence onset (first 3 windows)",
+    x       = "Window index",
+    y       = "RelDev (%)",
+    caption = "Cohort mean. Dashed line = 0% (sequence onset)."
+  ) +
+  theme_amstrom_hgrid
+
+print(p_ex_dyn_reldev)
+print(p_ex_sta_reldev)
+```
+
+## 7.2 Phase angle — standalone
+
+```{r bia_pha_trajectory, fig.width=8, fig.height=8}
+# Phase angle on its own (the most discriminating BIA fatigue marker): EX_DYN and EX_STA, per freq.
+pha_dyn_mean <- ex_dyn_reldev_mean |>
+  dplyr::filter(.data$summary_variable == "PhA")
+
+pha_sta_mean <- ex_sta_reldev_mean |>
+  dplyr::filter(.data$summary_variable == "PhA")
+
+p_pha_dyn <- ggplot(pha_dyn_mean,
+  aes(x = .data$VC_count, y = .data$mean_reldev)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+  geom_line(linewidth = 0.35, colour = col_bia) +
+  geom_point(shape = 15, size = 2.2, colour = col_bia) +
+  facet_wrap(~ freq_label, ncol = 1, scales = "free_y") +
+  labs(title = "Phase angle - EX_DYN",
+       x = "Repetition", y = "PhA RelDev (%)") +
+  theme_amstrom_hgrid
+
+p_pha_sta <- ggplot(pha_sta_mean,
+  aes(x = .data$window_index, y = .data$mean_reldev)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+  geom_line(linewidth = 0.35, colour = col_bia) +
+  geom_point(shape = 15, size = 2.2, colour = col_bia) +
+  facet_wrap(~ freq_label, ncol = 1, scales = "free_y") +
+  labs(title = "Phase angle - EX_STA",
+       x = "Window index", y = "PhA RelDev (%)",
+       caption = "Baseline = SVC_70% mean. EX_STA onset carries pre-loaded fatigue from EX_DYN.") +
+  theme_amstrom_hgrid
+
+print(p_pha_dyn)
+print(p_pha_sta)
+```
+
+## 7.3 Diagnostic: 9.76 kHz EX_STA extreme swings
+
+```{r diag_9khz_ex_sta, fig.width=10, fig.height=7}
+sta_9k <- cohort_bia_ex_sta_feature_table |>
+  dplyr::filter(.data$freq_hz == 9760)
+
+# --- Table: worst offenders per variable ---
+outlier_table <- sta_9k |>
+  dplyr::group_by(.data$RUN_ID, .data$summary_variable) |>
+  dplyr::summarise(
+    max_abs_reldev = round(max(abs(.data$reldev_seq_pct), na.rm = TRUE), 1),  # worst swing magnitude
+    min_reldev     = round(min(.data$reldev_seq_pct, na.rm = TRUE), 1),       # most negative
+    max_reldev     = round(max(.data$reldev_seq_pct, na.rm = TRUE), 1),       # most positive
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(.data$max_abs_reldev))
+
+cat("Top 15 run x variable combinations by max |RelDev| at 9.76 kHz EX_STA:\n")
+print(head(outlier_table, 15))
+
+# --- Spaghetti plot ---
+sta_9k_mean <- sta_9k |>
+  dplyr::group_by(.data$window_index, .data$summary_variable) |>
+  dplyr::summarise(mean_reldev = mean(.data$reldev_seq_pct, na.rm = TRUE),
+                   .groups = "drop")
+
+ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72",
+             linewidth = 0.35) +
+  geom_line(
+    data = sta_9k,
+    aes(x = .data$window_index, y = .data$reldev_seq_pct, group = .data$RUN_ID),
+    colour = "grey75", linewidth = 0.35, alpha = 0.7
+  ) +
+  geom_line(
+    data = sta_9k_mean,
+    aes(x = .data$window_index, y = .data$mean_reldev),
+    colour = col_bia, linewidth = 1.1
+  ) +
+  facet_wrap(~ summary_variable, ncol = 2, scales = "free_y") +
+  labs(
+    title   = "9.76 kHz EX_STA - individual runs (grey) vs. cohort mean (purple)",
+    x       = "Window index",
+    y       = "RelDev (%)",
+    caption = "If only a few grey lines are extreme, the mean is being pulled by outliers."
+  ) +
+  theme_amstrom_hgrid
+```
+
+---
+
+# 8. BIA reference and checkpoint overview
+
+Cohort mean ± SD of absolute BIA values across contraction levels and recovery checkpoints,
+faceted by variable and coloured by frequency.
+
+```{r bia_reference_overview, fig.width=10, fig.height=8}
+# Cohort mean/SD of absolute BIA values per state, faceted by variable, coloured by frequency.
+reference_plot_table <- cohort_bia_reference_feature_table |>
+  dplyr::group_by(.data$state_label, .data$summary_variable,
+                  .data$freq_hz, .data$freq_label) |>
+  dplyr::summarise(
+    mean_value = mean(.data$summary_value, na.rm = TRUE),  # cohort mean absolute value
+    sd_value   = sd(.data$summary_value, na.rm = TRUE),    # between-run SD
+    n_runs     = dplyr::n_distinct(.data$RUN_ID),          # runs at this state
+    .groups    = "drop"
+  ) |>
+  dplyr::mutate(
+    state_label = factor(.data$state_label,
+      levels = c("SVC_30%", "SVC_50%", "SVC_70%", "MVC_REF",
+                 "MVC_RECOV_DYN", "MVC_RECOV_STA"))
+  )
+
+p_reference <- ggplot(
+  reference_plot_table,
+  aes(x = .data$state_label, y = .data$mean_value,
+      colour = .data$freq_label, group = .data$freq_label)
+) +
+  geom_errorbar(
+    aes(ymin = .data$mean_value - .data$sd_value,
+        ymax = .data$mean_value + .data$sd_value),
+    width = 0, linewidth = 0.4, alpha = 0.28, position = position_dodge(0.5)
+  ) +
+  geom_line(linetype = "dotted", linewidth = 0.35, position = position_dodge(0.5)) +
+  geom_point(shape = 15, size = 2.2, position = position_dodge(0.5)) +
+  facet_wrap(~ summary_variable, ncol = 2, scales = "free_y") +
+  scale_colour_manual(values = bia_freq_pal, name = NULL) +
+  labs(
+    title   = "BIA reference and checkpoint — cohort overview",
+    subtitle = "Absolute values across contraction levels and recovery checkpoints",
+    x       = NULL, y = NULL,
+    caption = "Error bars = mean +/- SD. SVC = sustained voluntary contraction; MVC = maximal voluntary contraction."
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(p_reference)
+```
+
+---
+
+# 9. Summary tables
+
+Set `PRINT_SUMMARY_TABLES <- TRUE` in §1 setup to render these.
+
+## Reference absolute values (key sequences)
+
+```{r summary_ref, eval = PRINT_SUMMARY_TABLES}
+reference_plot_table |>
+  dplyr::filter(.data$state_label %in% c("SVC_70%", "MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA")) |>
+  dplyr::mutate(dplyr::across(c(mean_value, sd_value), ~round(.x, 3))) |>
+  dplyr::select(state_label, summary_variable, freq_label, mean_value, sd_value, n_runs) |>
+  dplyr::arrange(.data$summary_variable, .data$freq_label, .data$state_label) |>
+  knitr::kable(
+    col.names = c("State", "Variable", "Freq", "Mean", "SD", "N"),
+    caption   = "BIA absolute values at key reference sequences (cohort mean +/- SD)."
+  )
+```
+
+## EX_DYN RelDev - first vs last rep
+
+```{r summary_ex_dyn, eval = PRINT_SUMMARY_TABLES}
+ex_dyn_reldev_mean |>
+  dplyr::group_by(.data$summary_variable, .data$freq_label) |>
+  dplyr::filter(.data$VC_count == min(.data$VC_count) | .data$VC_count == max(.data$VC_count)) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    position     = dplyr::if_else(.data$VC_count == min(.data$VC_count), "First rep", "Last rep"),
+    mean_reldev  = round(.data$mean_reldev, 2)
+  ) |>
+  dplyr::select(summary_variable, freq_label, position, VC_count, mean_reldev) |>
+  dplyr::arrange(.data$summary_variable, .data$freq_label, .data$VC_count) |>
+  knitr::kable(
+    col.names = c("Variable", "Freq", "Position", "Rep", "Mean RelDev (%)"),
+    caption   = "EX_DYN RelDev from MVC_REF - first vs last rep. Expected direction: decrease (Freeborn & Fu 2019)."
+  )
+```
+
+## EX_STA RelDev - first vs last window
+
+```{r summary_ex_sta, eval = PRINT_SUMMARY_TABLES}
+ex_sta_reldev_mean |>
+  dplyr::group_by(.data$summary_variable, .data$freq_label) |>
+  dplyr::filter(.data$window_index == min(.data$window_index) | .data$window_index == max(.data$window_index)) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    position    = dplyr::if_else(.data$window_index == min(.data$window_index), "First window", "Last window"),
+    mean_reldev = round(.data$mean_reldev, 2)
+  ) |>
+  dplyr::select(summary_variable, freq_label, position, window_index, mean_reldev) |>
+  dplyr::arrange(.data$summary_variable, .data$freq_label, .data$window_index) |>
+  knitr::kable(
+    col.names = c("Variable", "Freq", "Position", "Window", "Mean RelDev (%)"),
+    caption   = "EX_STA RelDev from SVC_70% - first vs last window. PhA is the most discriminating marker (Dalton-Alves 2025)."
+  )
+```
+
+## Cole parameters at reference sequences
+
+```{r summary_cole, eval = PRINT_SUMMARY_TABLES}
+cohort_cole_reference_table |>
+  dplyr::filter(!is.na(.data$R_inf)) |>
+  dplyr::group_by(.data$source_sequence) |>
+  dplyr::summarise(
+    n       = dplyr::n_distinct(.data$RUN_ID),
+    R_inf   = round(mean(.data$R_inf,   na.rm = TRUE), 2),
+    delta_R = round(mean(.data$delta_R, na.rm = TRUE), 2),
+    R0      = round(mean(.data$R0,      na.rm = TRUE), 2),
+    fc_khz  = round(mean(.data$fc_hz,   na.rm = TRUE) / 1000, 1),
+    alpha   = round(mean(.data$alpha,   na.rm = TRUE), 3),
+    .groups = "drop"
+  ) |>
+  knitr::kable(
+    col.names = c("Sequence", "N", "R_inf (Ohm)", "delta_R (Ohm)", "R0 (Ohm)", "fc (kHz)", "alpha"),
+    caption   = "Cole model parameters at reference sequences (cohort mean). R_inf and fc are extrapolated for ~10% of fits (fc > 122 kHz)."
+  )

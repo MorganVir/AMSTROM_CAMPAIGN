@@ -1,0 +1,265 @@
+---
+title: "AMSTROM — Myoton Individual Pipeline"
+output: html_document
+params:
+  RUN_ID: "487LePa_20251003"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(dplyr)
+library(ggplot2)
+library(arrow)
+library(tidyr)
+```
+
+```{r controls}
+RUN_ID              <- params$RUN_ID
+SHOW_QC_PLOTS       <- TRUE
+EXPORT_PARQUETS     <- TRUE
+
+# Checkpoint order — fixed by protocol sequence (main.ipynb SEQ_ORDER)
+# INIT WU REST0 MVC_REF REST1 SVC_REF REST2 EX_DYN REST3 MVC_RECOV_DYN REST4 EX_STA REST5 MVC_RECOV_STA END
+# Myoton is measured at rest only: after_wu, before_dyn, after_dyn (x2), before_sta, after_sta (x2)
+CHECKPOINT_LEVELS <- c("after_wu", "before_dyn", "after_dyn_1", "after_dyn_2", "before_sta", "after_sta_1", "after_sta_2")
+
+# Relative deviation baseline:
+# before_dyn = immediately before EX_DYN (after reference tests) — primary pre-exercise state
+# before_sta = immediately before EX_STA — secondary baseline for EX_STA context
+RELDEV_BASELINE <- "before_dyn"
+
+# Colours
+col_myo       <- "#2a9d8f"   # teal — Myoton primary
+
+# Paths
+export_root <- here::here("results", "DATA_EXPORT", RUN_ID)
+myoton_parquet_path        <- file.path(export_root, "preprocessed_myoton.parquet")
+checkpoint_table_path      <- file.path(export_root, "myoton_checkpoint_feature_table.parquet")
+```
+
+```{r theme}
+# House plot theme: half-open frame, horizontal gridlines only, outward ticks.
+theme_amstrom_hgrid <- theme_classic(base_size = 13) +
+  theme(
+    axis.line.y        = element_blank(),
+    axis.ticks.y       = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.4),
+    axis.ticks.length.x.bottom = unit(3.5, "pt"),
+    axis.ticks.length.y.left   = unit(3.5, "pt")
+  )
+```
+
+---
+
+## `r RUN_ID` — Myoton checkpoint analysis
+
+---
+
+```{r load_data}
+# Load the preprocessed Myoton table for this run.
+stopifnot(file.exists(myoton_parquet_path))
+myoton_raw <- arrow::read_parquet(myoton_parquet_path)
+
+myo_metrics  <- c("myo_Frequency", "myo_Stiffness", "myo_Decrement", "myo_Relaxation", "myo_Creep")
+participant_id <- sub("_[0-9]{8}$", "", RUN_ID)  # RUN_ID minus the trailing _YYYYMMDD
+```
+
+```{r split_rows}
+# Keep only the measurement rows (drop any header/metadata rows).
+myoton_tests <- myoton_raw |> dplyr::filter(.data$row_type == "test")
+```
+
+```{r assign_checkpoints}
+# REST3 and REST5 each contain 2 Myoton tests (distinct myo_test_id values within the SEQ).
+# Rank by myo_test_id within each SEQ to assign _1 and _2 suffixes.
+myoton_tests <- myoton_tests |>
+  dplyr::group_by(.data$SEQ) |>
+  dplyr::mutate(
+    test_rank = rank(.data$myo_test_id, ties.method = "first"),  # order the 2 tests within REST3/REST5
+    checkpoint = dplyr::case_when(
+      .data$SEQ == "REST0" ~ "after_wu",
+      .data$SEQ == "REST2" ~ "before_dyn",
+      .data$SEQ == "REST4" ~ "before_sta",
+      .data$SEQ == "REST3" ~ paste0("after_dyn_", .data$test_rank),
+      .data$SEQ == "REST5" ~ paste0("after_sta_", .data$test_rank),
+      TRUE ~ paste0(.data$SEQ, "_", .data$test_rank)
+    )
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    checkpoint = factor(.data$checkpoint, levels = CHECKPOINT_LEVELS),
+    checkpoint_order = as.integer(.data$checkpoint)
+  )
+
+n_checkpoints <- dplyr::n_distinct(myoton_tests$checkpoint)
+cat(sprintf("[%s] %d checkpoints found: %s\n",
+    RUN_ID, n_checkpoints,
+    paste(sort(unique(as.character(myoton_tests$checkpoint))), collapse = ", ")))
+```
+
+```{r compute_reldev}
+# Compute reldev_pct relative to RELDEV_BASELINE (REST2 = pre-EX_DYN state).
+# REST0 is post-WU, pre-MVC_REF — reported as-is, not used as normalization anchor.
+baseline_row <- myoton_tests |>
+  dplyr::filter(.data$checkpoint == RELDEV_BASELINE) |>
+  dplyr::summarise(dplyr::across(dplyr::all_of(myo_metrics), mean, na.rm = TRUE))
+
+if (nrow(baseline_row) == 0) {
+  warning(sprintf("[%s] Baseline checkpoint '%s' not found — reldev will be NA.", RUN_ID, RELDEV_BASELINE))
+  myoton_tests <- myoton_tests |>
+    dplyr::mutate(dplyr::across(
+      dplyr::all_of(myo_metrics),
+      ~ NA_real_,
+      .names = "reldev_{.col}"
+    ))
+} else {
+  for (m in myo_metrics) {
+    ref_val <- baseline_row[[m]]
+    reldev_col <- paste0("reldev_", m)
+    myoton_tests[[reldev_col]] <- (myoton_tests[[m]] - ref_val) / ref_val * 100  # % change from before_dyn baseline
+  }
+}
+```
+
+```{r build_checkpoint_feature_table}
+# Assemble the per-checkpoint export table. participant_id is handled in two steps -- the
+# select() reserves nothing for it, then we drop any stray copy and re-add it cleanly -- so
+# the final column order comes out fixed regardless of what was already on myoton_tests.
+reldev_cols <- paste0("reldev_", myo_metrics)
+
+myoton_checkpoint_feature_table <- myoton_tests |>
+  dplyr::select(
+    RUN_ID          = "run_id",
+    participant_id  = dplyr::all_of(character(0)),  # added below
+    checkpoint,
+    checkpoint_order,
+    SEQ,
+    myo_test_id,
+    sequence_valid,
+    dplyr::all_of(myo_metrics),
+    dplyr::all_of(reldev_cols)
+  ) |>
+  dplyr::mutate(
+    RUN_ID         = RUN_ID,
+    participant_id = participant_id,
+    reldev_baseline = RELDEV_BASELINE
+  ) |>
+  dplyr::arrange(.data$checkpoint_order)
+
+# Drop intermediate column if present
+myoton_checkpoint_feature_table <- myoton_checkpoint_feature_table |>
+  dplyr::select(-dplyr::any_of("participant_id")) |>
+  dplyr::mutate(participant_id = !!participant_id) |>
+  dplyr::select(RUN_ID, participant_id, checkpoint, checkpoint_order, SEQ,
+                myo_test_id, sequence_valid, reldev_baseline,
+                dplyr::all_of(myo_metrics), dplyr::all_of(reldev_cols))
+```
+
+
+---
+
+## Checkpoint overview
+
+```{r checkpoint_table_display}
+# Display table: per-checkpoint test means + RelDev for the key metrics.
+myoton_checkpoint_feature_table |>
+  dplyr::select(checkpoint, sequence_valid,
+                myo_Stiffness, myo_Frequency, myo_Decrement, myo_Relaxation, myo_Creep,
+                reldev_myo_Stiffness, reldev_myo_Frequency) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~round(., 2))) |>
+  knitr::kable(
+    col.names = c("Checkpoint", "Valid", "Stiffness (N/m)", "Frequency (Hz)",
+                  "Decrement", "Relaxation (ms)", "Creep",
+                  "Stiffness reldev (%)", "Frequency reldev (%)"),
+    caption = paste0("Myoton test-mean values per checkpoint. reldev = % change from ", RELDEV_BASELINE, ".")
+  )
+```
+
+---
+
+## Checkpoint trajectory plots
+
+```{r checkpoint_trajectory_plot, fig.width=10, fig.height=8}
+# QC plot: each metric across checkpoints, point shape marks valid vs invalid tests.
+if (SHOW_QC_PLOTS) {
+  metric_labels <- c(
+    myo_Stiffness  = "Stiffness (N/m)",
+    myo_Frequency  = "Frequency (Hz)",
+    myo_Decrement  = "Decrement (D)",
+    myo_Relaxation = "Relaxation (ms)",
+    myo_Creep      = "Creep"
+  )
+
+  plot_df <- myoton_checkpoint_feature_table |>
+    dplyr::select(checkpoint, checkpoint_order, sequence_valid, dplyr::all_of(myo_metrics)) |>
+    tidyr::pivot_longer(dplyr::all_of(myo_metrics), names_to = "metric", values_to = "value") |>
+    dplyr::mutate(
+      metric = factor(.data$metric, levels = names(metric_labels),
+                      labels = unname(metric_labels))
+    )
+
+  ggplot(plot_df, aes(x = .data$checkpoint, y = .data$value, group = 1)) +
+    geom_line(colour = col_myo, linewidth = 0.8) +
+    geom_point(
+      aes(shape = factor(.data$sequence_valid)),
+      colour = col_myo, size = 3
+    ) +
+    scale_shape_manual(values = c("0" = 4, "1" = 19),
+                       labels = c("0" = "invalid", "1" = "valid"),
+                       name = "sequence_valid") +
+    facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+    labs(
+      title = paste0(RUN_ID, " - Myoton checkpoint trajectory"),
+      subtitle = paste0("Vertical line = ", RELDEV_BASELINE, " (reldev baseline)"),
+      x = "Checkpoint", y = NULL
+    ) +
+    geom_vline(xintercept = RELDEV_BASELINE, linetype = "dashed",
+               colour = "grey60", linewidth = 0.4) +
+    theme_amstrom_hgrid +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1))
+}
+```
+
+## Relative deviation from `r RELDEV_BASELINE`
+
+```{r reldev_plot, fig.width=10, fig.height=6}
+# QC plot: RelDev (% from before_dyn) per metric across checkpoints.
+if (SHOW_QC_PLOTS) {
+  reldev_plot_df <- myoton_checkpoint_feature_table |>
+    dplyr::select(checkpoint, checkpoint_order,
+                  dplyr::all_of(reldev_cols)) |>
+    tidyr::pivot_longer(dplyr::all_of(reldev_cols),
+                        names_to = "metric", values_to = "reldev_pct") |>
+    dplyr::mutate(
+      metric = sub("^reldev_myo_", "", .data$metric),
+      metric = factor(.data$metric,
+                      levels = c("Stiffness", "Frequency", "Decrement", "Relaxation", "Creep"))
+    )
+
+  ggplot(reldev_plot_df, aes(x = .data$checkpoint, y = .data$reldev_pct, group = 1)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+    geom_line(colour = col_myo, linewidth = 0.8) +
+    geom_point(colour = col_myo, size = 2.5, shape = 19) +
+    facet_wrap(~ metric, scales = "free_y", ncol = 3) +
+    scale_y_continuous(labels = function(x) paste0(round(x), "%")) +
+    labs(
+      title = paste0(RUN_ID, " - Myoton reldev from ", RELDEV_BASELINE),
+      x = "Checkpoint", y = paste0("% change from ", RELDEV_BASELINE)
+    ) +
+    theme_amstrom_hgrid +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1))
+}
+```
+
+
+---
+
+## Export
+
+```{r export}
+# Write the per-checkpoint feature table back next to the run's other exports.
+if (EXPORT_PARQUETS) {
+  arrow::write_parquet(myoton_checkpoint_feature_table, checkpoint_table_path)
+  cat(sprintf("[%s] Exported:\n  %s\n", RUN_ID, checkpoint_table_path))
+}
+```

@@ -1,0 +1,548 @@
+---
+title: "AMSTROM Myoton Cohort Analysis"
+author: "Morgan Virolan"
+date: "2026-05-16"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+---
+
+# Overview
+
+Cohort Myoton analysis: pool checkpoint features, plot absolute/RelDev trajectories, and write the pooled cohort table.
+
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(glue)
+
+options(dplyr.summarise.inform = FALSE)
+source(here::here("sources", "R", "config", "amstrom_style.R"))
+```
+
+```{r controls}
+export_root        <- here::here("results", "DATA_EXPORT")
+cohort_output_root <- here::here("results", "R_ANALYSIS", "cohort")
+
+CHECKPOINT_LEVELS <- c("after_wu", "before_dyn", "after_dyn_1", "after_dyn_2", "before_sta", "after_sta_1", "after_sta_2")
+RELDEV_BASELINE   <- "before_dyn"
+EXPORT_COHORT_PARQUET <- TRUE
+PRINT_SUMMARY_TABLES  <- FALSE
+
+myo_metrics  <- c("myo_Frequency", "myo_Stiffness", "myo_Decrement", "myo_Relaxation", "myo_Creep")
+reldev_cols  <- paste0("reldev_", myo_metrics)
+
+metric_labels <- c(
+  myo_Stiffness  = "Stiffness (N/m)",
+  myo_Frequency  = "Frequency (Hz)",
+  myo_Decrement  = "Decrement (D)",
+  myo_Relaxation = "Relaxation (ms)",
+  myo_Creep      = "Creep"
+)
+```
+
+---
+
+# 2. Discover runs
+
+Runs are pooled from the shared `cohort_final` block so all cohort notebooks use the same sample.
+
+```{r discover_runs}
+subset_registry <- arrow::read_parquet(here::here("results", "R_ANALYSIS", "subset_registry", "multimodal_subset_registry.parquet"
+))
+myoton_run_ids <- subset_registry |>
+  dplyr::filter(.data$analysis_block == "cohort_final", .data$included == 1L) |>
+  dplyr::pull(.data$RUN_ID) |>
+  sort()
+
+cat("Cohort N (cohort_final):", length(myoton_run_ids), "\n")
+print(myoton_run_ids)
+```
+
+---
+
+# 3. Pool tables
+
+Read each run's `myoton_checkpoint_feature_table` and stack into one pooled table; `checkpoint`
+is restored as an ordered factor so trajectories plot in protocol order.
+
+```{r pool_tables}
+# Read every run's checkpoint table, stack, and restore `checkpoint` as an ordered factor.
+paths  <- file.path(export_root, myoton_run_ids, "myoton_checkpoint_feature_table.parquet")
+exists <- file.exists(paths)
+
+if (any(!exists)) {
+  warning(glue("Missing {sum(!exists)} parquet(s): {paste(myoton_run_ids[!exists], collapse = ', ')}"))
+}
+
+myo_pooled <- dplyr::bind_rows(lapply(paths[exists], arrow::read_parquet)) |>
+  dplyr::mutate(checkpoint = factor(.data$checkpoint, levels = CHECKPOINT_LEVELS))
+
+cat("Total rows:", nrow(myo_pooled),
+    "| Runs:", dplyr::n_distinct(myo_pooled$RUN_ID),
+    "| Checkpoints:", dplyr::n_distinct(myo_pooled$checkpoint), "\n")
+```
+
+---
+
+# 4. Validity audit
+
+Count valid/invalid checkpoints per run, then keep only `sequence_valid == 1` rows -- every
+analysis below runs on the filtered `myo_valid`.
+
+```{r validity_table}
+# Count valid vs invalid checkpoints per run (QC table).
+validity_summary <- myo_pooled |>
+  dplyr::mutate(valid_label = dplyr::if_else(.data$sequence_valid == 1L, "valid", "invalid")) |>
+  dplyr::count(.data$checkpoint, .data$valid_label) |>
+  tidyr::pivot_wider(names_from = .data$valid_label, values_from = .data$n, values_fill = 0L) |>
+  dplyr::arrange(.data$checkpoint)
+
+knitr::kable(
+  validity_summary,
+  caption = "Myoton sequence validity per checkpoint (count of runs)."
+)
+```
+
+```{r filter_valid}
+# Keep only valid checkpoints; every analysis downstream uses myo_valid.
+myo_valid <- myo_pooled |>
+  dplyr::filter(.data$sequence_valid == 1L)
+
+n_dropped <- nrow(myo_pooled) - nrow(myo_valid)
+cat(glue(
+  "{nrow(myo_valid)} valid checkpoint rows retained ({n_dropped} invalid excluded).\n",
+  "Runs represented: {dplyr::n_distinct(myo_valid$RUN_ID)}\n"
+))
+```
+
+---
+
+# 5. Absolute values at before_dyn
+
+Distribution of absolute Myoton values at `before_dyn` (the pre-EX_DYN baseline), one boxplot
++ jittered runs per metric.
+
+```{r rest2_boxplot, fig.width=9, fig.height=5}
+# Absolute values at before_dyn: pivot long, one boxplot + jittered runs per metric.
+rest2_df <- myo_valid |>
+  dplyr::filter(.data$checkpoint == "before_dyn") |>
+  dplyr::select(RUN_ID, dplyr::all_of(myo_metrics)) |>
+  tidyr::pivot_longer(dplyr::all_of(myo_metrics), names_to = "metric", values_to = "value") |>
+  dplyr::mutate(metric = factor(.data$metric, levels = names(metric_labels),
+                                labels = unname(metric_labels)))
+
+n_rest2 <- dplyr::n_distinct(rest2_df$RUN_ID)
+
+ggplot(rest2_df, aes(x = .data$metric, y = .data$value)) +
+  geom_boxplot(width = 0.45, fill = "white", colour = col_myoton, outlier.shape = NA) +
+  geom_jitter(width = 0.13, size = 1.6, colour = col_myoton, alpha = 0.6) +
+  facet_wrap(~ metric, scales = "free", ncol = 3) +
+  labs(
+    title    = "Myoton - before_dyn absolute values (pre-EX_DYN baseline)",
+    subtitle = glue("N = {n_rest2} runs."),
+    x        = NULL,
+    y        = "Value (metric-specific units)"
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+---
+
+# 6. Checkpoint trajectory - absolute values
+
+Cohort mean ± SD of the two reported metrics (frequency, stiffness) across the
+EX_DYN-relevant checkpoints.
+
+```{r checkpoint_trajectory, fig.width=8, fig.height=4}
+# Memoir Fig 5: EX_DYN-relevant checkpoints only (EX_STA parked), plain labels,
+# and the two reported metrics (frequency, stiffness).
+checkpoint_keep   <- c("after_wu", "before_dyn", "after_dyn_1")
+checkpoint_labels <- c(after_wu = "Warm-up", before_dyn = "Pre", after_dyn_1 = "Post")
+
+traj_summary <- myo_valid |>
+  dplyr::filter(.data$checkpoint %in% checkpoint_keep) |>
+  dplyr::select(RUN_ID, checkpoint, dplyr::all_of(c("myo_Frequency", "myo_Stiffness"))) |>
+  tidyr::pivot_longer(dplyr::all_of(c("myo_Frequency", "myo_Stiffness")),
+                      names_to = "metric", values_to = "value") |>
+  dplyr::mutate(
+    metric     = factor(.data$metric, levels = c("myo_Frequency", "myo_Stiffness"),
+                        labels = c("Frequency (Hz)", "Stiffness (N/m)")),
+    checkpoint = factor(unname(checkpoint_labels[.data$checkpoint]),
+                        levels = unname(checkpoint_labels))
+  ) |>
+  dplyr::group_by(.data$checkpoint, .data$metric) |>
+  dplyr::summarise(
+    mean_val = mean(.data$value, na.rm = TRUE),  # cohort mean (absolute units)
+    sd_val   = sd(.data$value, na.rm = TRUE),    # between-run SD
+    n        = dplyr::n(),                       # runs at this checkpoint
+    .groups  = "drop"
+  )
+
+ggplot(traj_summary, aes(x = .data$checkpoint, y = .data$mean_val, group = 1)) +
+  geom_errorbar(aes(ymin = mean_val - sd_val, ymax = mean_val + sd_val),
+                width = 0, colour = col_myoton, linewidth = 0.4, alpha = 0.28) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_myoton) +
+  geom_point(shape = 15, size = 2.2, colour = col_myoton) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+  labs(
+    title    = "Myoton - VL frequency and stiffness across checkpoints",
+    subtitle = glue("Cohort mean +/- SD. N = {max(traj_summary$n)} runs."),
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+```
+
+---
+
+# 7. RelDev trajectory - % change from before_dyn
+
+Cohort mean ± SD RelDev (% change from `before_dyn`) for all five metrics across checkpoints.
+
+```{r reldev_trajectory, fig.width=10, fig.height=8}
+# RelDev (% from before_dyn) for all five metrics: pivot long, cohort mean/SD per checkpoint.
+reldev_summary <- myo_valid |>
+  dplyr::select(RUN_ID, checkpoint, checkpoint_order, dplyr::all_of(reldev_cols)) |>
+  tidyr::pivot_longer(dplyr::all_of(reldev_cols), names_to = "metric", values_to = "reldev_pct") |>
+  dplyr::mutate(
+    metric = sub("^reldev_myo_", "", .data$metric),
+    metric = factor(.data$metric,
+                    levels = c("Stiffness", "Frequency", "Decrement", "Relaxation", "Creep"))
+  ) |>
+  dplyr::group_by(.data$checkpoint, .data$checkpoint_order, .data$metric) |>
+  dplyr::summarise(
+    mean_reldev = mean(.data$reldev_pct, na.rm = TRUE),  # cohort mean % change from before_dyn
+    sd_reldev   = sd(.data$reldev_pct, na.rm = TRUE),    # between-run SD
+    n           = dplyr::n(),                            # runs at this checkpoint
+    .groups     = "drop"
+  )
+
+ggplot(reldev_summary, aes(x = .data$checkpoint, y = .data$mean_reldev, group = 1)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # zero = no change from baseline
+  geom_errorbar(aes(ymin = mean_reldev - sd_reldev, ymax = mean_reldev + sd_reldev),
+                width = 0, colour = col_myoton, linewidth = 0.4, alpha = 0.28) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_myoton) +
+  geom_point(shape = 15, size = 2.2, colour = col_myoton) +
+  scale_y_continuous(labels = function(x) paste0(round(x), "%")) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+  labs(
+    title    = "Myoton - RelDev from before_dyn (cohort mean +/- SD)",
+    subtitle = glue("N = {max(reldev_summary$n)} runs. Dashed line = 0% (before_dyn baseline)."),
+    x        = "Checkpoint",
+    y        = paste0("% change from ", RELDEV_BASELINE)
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+---
+
+# 8. EX_DYN effect - before_dyn to after_dyn_1
+
+The `before_dyn -> after_dyn_1` change, drawn as paired per-run lines (grey) with the cohort
+mean ± SD overlaid -- once in absolute units, once as % change from `before_dyn`.
+
+## Absolute values
+
+```{r ex_dyn_effect, fig.width=7, fig.height=9}
+# before_dyn vs after_dyn_1 in absolute units: paired per-run lines (grey) + cohort mean +/- SD.
+ex_dyn_ind <- myo_valid |>
+  dplyr::filter(.data$checkpoint %in% c("before_dyn", "after_dyn_1")) |>
+  dplyr::mutate(checkpoint = factor(.data$checkpoint, levels = c("before_dyn", "after_dyn_1"))) |>
+  dplyr::select(RUN_ID, checkpoint, dplyr::all_of(myo_metrics)) |>
+  tidyr::pivot_longer(dplyr::all_of(myo_metrics), names_to = "metric", values_to = "value") |>
+  dplyr::mutate(metric = factor(.data$metric, levels = names(metric_labels),
+                                labels = unname(metric_labels)))
+
+ex_dyn_mean <- ex_dyn_ind |>
+  dplyr::group_by(.data$checkpoint, .data$metric) |>
+  dplyr::summarise(
+    mean_val = mean(.data$value, na.rm = TRUE),  # cohort mean (absolute units)
+    sd_val   = sd(.data$value, na.rm = TRUE),    # between-run SD
+    n        = dplyr::n(),                       # runs at this checkpoint
+    .groups  = "drop"
+  )
+
+ggplot(ex_dyn_ind, aes(x = .data$checkpoint, y = .data$value)) +
+  geom_line(aes(group = RUN_ID), colour = "grey78", linewidth = 0.4, alpha = 0.65) +
+  geom_point(colour = "grey78", size = 1.3, alpha = 0.65) +
+  geom_line(data = ex_dyn_mean, aes(y = mean_val, group = 1),
+            colour = col_myoton, linewidth = 1.2) +
+  geom_errorbar(data = ex_dyn_mean,
+                aes(y = mean_val, ymin = mean_val - sd_val, ymax = mean_val + sd_val),
+                width = 0.1, colour = col_myoton, linewidth = 0.7) +
+  geom_point(data = ex_dyn_mean, aes(y = mean_val),
+             colour = col_myoton, size = 3, shape = 19) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+  labs(
+    title    = "Myoton - EX_DYN effect: before_dyn to after_dyn_1 (absolute)",
+    subtitle = glue("N = {max(ex_dyn_mean$n)} runs. Grey = individual, bold = cohort mean +/- SD."),
+    x = "Checkpoint", y = NULL
+  ) +
+  theme_amstrom_hgrid
+```
+
+## % change from before_dyn
+
+```{r ex_dyn_reldev, fig.width=7, fig.height=9}
+# Same before_dyn vs after_dyn_1 comparison, expressed as % change from before_dyn.
+ex_dyn_rd_ind <- myo_valid |>
+  dplyr::filter(.data$checkpoint %in% c("before_dyn", "after_dyn_1")) |>
+  dplyr::mutate(checkpoint = factor(.data$checkpoint, levels = c("before_dyn", "after_dyn_1"))) |>
+  dplyr::select(RUN_ID, checkpoint, dplyr::all_of(reldev_cols)) |>
+  tidyr::pivot_longer(dplyr::all_of(reldev_cols), names_to = "metric", values_to = "reldev_pct") |>
+  dplyr::mutate(metric = factor(sub("^reldev_myo_", "", .data$metric),
+                                levels = sub("^myo_", "", myo_metrics)))
+
+ex_dyn_rd_mean <- ex_dyn_rd_ind |>
+  dplyr::group_by(.data$checkpoint, .data$metric) |>
+  dplyr::summarise(
+    mean_val = mean(.data$reldev_pct, na.rm = TRUE),  # cohort mean % change
+    sd_val   = sd(.data$reldev_pct,   na.rm = TRUE),  # between-run SD
+    n        = dplyr::n(),                            # runs at this checkpoint
+    .groups  = "drop"
+  )
+
+ggplot(ex_dyn_rd_ind, aes(x = .data$checkpoint, y = .data$reldev_pct)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # zero = no change from baseline
+  geom_line(aes(group = RUN_ID), colour = "grey78", linewidth = 0.4, alpha = 0.65) +
+  geom_point(colour = "grey78", size = 1.3, alpha = 0.65) +
+  geom_line(data = ex_dyn_rd_mean, aes(y = mean_val, group = 1),
+            colour = col_myoton, linewidth = 1.2) +
+  geom_errorbar(data = ex_dyn_rd_mean,
+                aes(y = mean_val, ymin = mean_val - sd_val, ymax = mean_val + sd_val),
+                width = 0.1, colour = col_myoton, linewidth = 0.7) +
+  geom_point(data = ex_dyn_rd_mean, aes(y = mean_val),
+             colour = col_myoton, size = 3, shape = 19) +
+  scale_y_continuous(labels = function(x) paste0(round(x), "%")) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+  labs(
+    title    = "Myoton - EX_DYN effect: % change from before_dyn",
+    subtitle = glue("N = {max(ex_dyn_rd_mean$n)} runs. before_dyn = 0% by definition."),
+    x = "Checkpoint", y = "% change from before_dyn"
+  ) +
+  theme_amstrom_hgrid
+```
+
+---
+
+# 9. EX_STA effect - before_sta to after_sta_1
+
+Same paired-line layout as §8, but for `before_sta -> after_sta_1`. RelDev here is baselined on
+`before_sta` (computed in the first chunk), independent of any EX_DYN carry-over.
+
+```{r compute_ex_sta_reldev_rest4}
+# Per-run reldev from before_sta (not before_dyn) for all 5 parameters. Computed here; not in the export schema.
+param_names <- sub("^myo_", "", myo_metrics)
+rd4_cols    <- paste0("rd4_", param_names)
+
+rest4_vals <- myo_valid |>
+  dplyr::filter(.data$checkpoint == "before_sta") |>
+  dplyr::select(RUN_ID, dplyr::all_of(myo_metrics)) |>
+  dplyr::rename_with(~ paste0("rest4_", sub("^myo_", "", .x)), dplyr::all_of(myo_metrics))
+
+myo_ex_sta_rd4 <- myo_valid |>
+  dplyr::filter(.data$checkpoint %in% c("before_sta", "after_sta_1", "after_sta_2")) |>
+  dplyr::left_join(rest4_vals, by = "RUN_ID") |>
+  dplyr::mutate(checkpoint = factor(.data$checkpoint, levels = c("before_sta", "after_sta_1", "after_sta_2")))
+
+for (p in param_names) {
+  myo_ex_sta_rd4[[paste0("rd4_", p)]] <-
+    (myo_ex_sta_rd4[[paste0("myo_", p)]] - myo_ex_sta_rd4[[paste0("rest4_", p)]]) /
+     myo_ex_sta_rd4[[paste0("rest4_", p)]] * 100
+}
+```
+
+## Absolute values
+
+```{r ex_sta_effect, fig.width=7, fig.height=9}
+# before_sta vs after_sta_1 in absolute units: paired per-run lines + cohort mean +/- SD.
+ex_sta_ind <- myo_valid |>
+  dplyr::filter(.data$checkpoint %in% c("before_sta", "after_sta_1")) |>
+  dplyr::mutate(checkpoint = factor(.data$checkpoint, levels = c("before_sta", "after_sta_1"))) |>
+  dplyr::select(RUN_ID, checkpoint, dplyr::all_of(myo_metrics)) |>
+  tidyr::pivot_longer(dplyr::all_of(myo_metrics), names_to = "metric", values_to = "value") |>
+  dplyr::mutate(metric = factor(.data$metric, levels = names(metric_labels),
+                                labels = unname(metric_labels)))
+
+ex_sta_mean <- ex_sta_ind |>
+  dplyr::group_by(.data$checkpoint, .data$metric) |>
+  dplyr::summarise(
+    mean_val = mean(.data$value, na.rm = TRUE),  # cohort mean (absolute units)
+    sd_val   = sd(.data$value, na.rm = TRUE),    # between-run SD
+    n        = dplyr::n(),                       # runs at this checkpoint
+    .groups  = "drop"
+  )
+
+ggplot(ex_sta_ind, aes(x = .data$checkpoint, y = .data$value)) +
+  geom_line(aes(group = RUN_ID), colour = "grey78", linewidth = 0.4, alpha = 0.65) +
+  geom_point(colour = "grey78", size = 1.3, alpha = 0.65) +
+  geom_line(data = ex_sta_mean, aes(y = mean_val, group = 1),
+            colour = col_myoton, linewidth = 1.2) +
+  geom_errorbar(data = ex_sta_mean,
+                aes(y = mean_val, ymin = mean_val - sd_val, ymax = mean_val + sd_val),
+                width = 0.1, colour = col_myoton, linewidth = 0.7) +
+  geom_point(data = ex_sta_mean, aes(y = mean_val),
+             colour = col_myoton, size = 3, shape = 19) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+  labs(
+    title    = "Myoton - EX_STA effect: before_sta to after_sta_1 (absolute)",
+    subtitle = glue("N = {max(ex_sta_mean$n)} runs. Grey = individual, bold = cohort mean +/- SD."),
+    x = "Checkpoint", y = NULL
+  ) +
+  theme_amstrom_hgrid
+```
+
+## % change from before_sta
+
+```{r ex_sta_reldev, fig.width=7, fig.height=9}
+# Same before_sta vs after_sta_1 comparison, as % change from before_sta (rd4 columns).
+ex_sta_rd_ind <- myo_ex_sta_rd4 |>
+  dplyr::filter(.data$checkpoint %in% c("before_sta", "after_sta_1")) |>
+  dplyr::select(RUN_ID, checkpoint, dplyr::all_of(rd4_cols)) |>
+  tidyr::pivot_longer(dplyr::all_of(rd4_cols), names_to = "metric", values_to = "reldev_pct") |>
+  dplyr::mutate(metric = factor(sub("^rd4_", "", .data$metric),
+                                levels = param_names))
+
+ex_sta_rd_mean <- ex_sta_rd_ind |>
+  dplyr::group_by(.data$checkpoint, .data$metric) |>
+  dplyr::summarise(
+    mean_val = mean(.data$reldev_pct, na.rm = TRUE),  # cohort mean % change
+    sd_val   = sd(.data$reldev_pct,   na.rm = TRUE),  # between-run SD
+    n        = dplyr::n(),                            # runs at this checkpoint
+    .groups  = "drop"
+  )
+
+ggplot(ex_sta_rd_ind, aes(x = .data$checkpoint, y = .data$reldev_pct)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # zero = no change from baseline
+  geom_line(aes(group = RUN_ID), colour = "grey78", linewidth = 0.4, alpha = 0.65) +
+  geom_point(colour = "grey78", size = 1.3, alpha = 0.65) +
+  geom_line(data = ex_sta_rd_mean, aes(y = mean_val, group = 1),
+            colour = col_myoton, linewidth = 1.2) +
+  geom_errorbar(data = ex_sta_rd_mean,
+                aes(y = mean_val, ymin = mean_val - sd_val, ymax = mean_val + sd_val),
+                width = 0.1, colour = col_myoton, linewidth = 0.7) +
+  geom_point(data = ex_sta_rd_mean, aes(y = mean_val),
+             colour = col_myoton, size = 3, shape = 19) +
+  scale_y_continuous(labels = function(x) paste0(round(x), "%")) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+  labs(
+    title    = "Myoton - EX_STA effect: % change from before_sta",
+    subtitle = glue("N = {max(ex_sta_rd_mean$n)} runs. before_sta = 0% by definition."),
+    x = "Checkpoint", y = "% change from before_sta"
+  ) +
+  theme_amstrom_hgrid
+```
+
+---
+
+# 10. Export
+
+```{r export}
+if (EXPORT_COHORT_PARQUET) {
+  dir.create(cohort_output_root, recursive = TRUE, showWarnings = FALSE)
+
+  cohort_path <- file.path(cohort_output_root, "myoton_cohort_pooled.parquet")
+  arrow::write_parquet(myo_valid, cohort_path)
+  cat(sprintf("Exported: %s\n  Runs: %d | Rows: %d\n",
+              cohort_path,
+              dplyr::n_distinct(myo_valid$RUN_ID),
+              nrow(myo_valid)))
+}
+```
+
+---
+
+# 11. Summary tables
+
+Set `PRINT_SUMMARY_TABLES <- TRUE` in §1 controls to render these.
+
+## before_dyn absolute values
+
+```{r summary_rest2, eval = PRINT_SUMMARY_TABLES}
+# Summary table: before_dyn absolute values, mean/SD/N per metric.
+dplyr::bind_rows(lapply(myo_metrics, function(m) {
+  v <- myo_valid[myo_valid$checkpoint == "before_dyn", m][[1]]
+  data.frame(
+    Metric = metric_labels[[m]],
+    Mean   = round(mean(v, na.rm = TRUE), 2),
+    SD     = round(sd(v,   na.rm = TRUE), 2),
+    N      = sum(is.finite(v))
+  )
+})) |>
+  knitr::kable(caption = "before_dyn absolute values (pre-EX_DYN baseline). Lit anchor (Lettner 2024 VL): Stiffness ~293-333 N/m, Frequency ~14-16 Hz.")
+```
+
+## Checkpoint trajectory
+
+```{r summary_trajectory, eval = PRINT_SUMMARY_TABLES}
+# Summary table: full checkpoint trajectory (absolute), cohort mean +/- SD.
+traj_summary |>
+  dplyr::select(checkpoint, metric, mean_val, sd_val, n) |>
+  dplyr::mutate(dplyr::across(c(mean_val, sd_val), ~round(.x, 2))) |>
+  knitr::kable(
+    col.names = c("Checkpoint", "Metric", "Mean", "SD", "N"),
+    caption   = "Full checkpoint trajectory - cohort mean +/- SD (absolute values)."
+  )
+```
+
+## RelDev trajectory (% from before_dyn)
+
+```{r summary_reldev, eval = PRINT_SUMMARY_TABLES}
+# Summary table: RelDev (% from before_dyn) trajectory, cohort mean +/- SD.
+reldev_summary |>
+  dplyr::select(checkpoint, metric, mean_reldev, sd_reldev, n) |>
+  dplyr::mutate(dplyr::across(c(mean_reldev, sd_reldev), ~round(.x, 1))) |>
+  knitr::kable(
+    col.names = c("Checkpoint", "Metric", "Mean reldev (%)", "SD (%)", "N"),
+    caption   = "RelDev from before_dyn (%). before_dyn = 0% by definition. Positive = increase vs baseline."
+  )
+```
+
+## EX_DYN effect (before_dyn vs after_dyn_1)
+
+```{r summary_ex_dyn, eval = PRINT_SUMMARY_TABLES}
+# Summary table: EX_DYN effect (before_dyn vs after_dyn_1), absolute + % change side by side.
+dplyr::bind_rows(
+  ex_dyn_mean    |> dplyr::mutate(type = "Absolute"),
+  ex_dyn_rd_mean |> dplyr::mutate(type = "% from before_dyn")
+) |>
+  dplyr::select(type, checkpoint, metric, mean_val, sd_val, n) |>
+  dplyr::mutate(dplyr::across(c(mean_val, sd_val), ~round(.x, 2))) |>
+  knitr::kable(
+    col.names = c("Type", "Checkpoint", "Metric", "Mean", "SD", "N"),
+    caption   = "EX_DYN effect: before_dyn vs after_dyn_1. Primary metrics (Stiffness, Frequency). Expected direction: decrease (high-intensity isometric, Frontiers 2020)."
+  )
+```
+
+## EX_STA effect (before_sta vs after_sta_1)
+
+```{r summary_ex_sta, eval = PRINT_SUMMARY_TABLES}
+# Summary table: EX_STA effect (before_sta vs after_sta_1), absolute + % change side by side.
+dplyr::bind_rows(
+  ex_sta_mean    |> dplyr::mutate(type = "Absolute"),
+  ex_sta_rd_mean |> dplyr::mutate(type = "% from before_sta")
+) |>
+  dplyr::select(type, checkpoint, metric, mean_val, sd_val, n) |>
+  dplyr::mutate(dplyr::across(c(mean_val, sd_val), ~round(.x, 2))) |>
+  knitr::kable(
+    col.names = c("Type", "Checkpoint", "Metric", "Mean", "SD", "N"),
+    caption   = "EX_STA effect: before_sta vs after_sta_1. Primary metrics only. Baseline = before_sta (independent of EX_DYN carry-over)."
+  )
+```

@@ -1,0 +1,1385 @@
+---
+title: "AMSTROM Cohort Analysis"
+author: "Morgan Virolan"
+date: "2026-04-20"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+---
+
+# Overview
+
+Cohort EMG analysis: pool per-run R exports, prepare summary plots, and optionally write cohort tables.
+
+# 1. Setup
+
+## 1.1 Load packages
+
+```{r setup_load_packages, message=FALSE, warning=FALSE}
+# Packages + shared cohort config. cohort_config.R defines the exclusion vectors and the
+# N=16 cohort_final set every cohort notebook pools from.
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+options(dplyr.summarise.inform = FALSE)
+source(here::here("sources", "R", "config", "cohort_config.R"))
+```
+
+# 2. Discover available runs
+
+## 2.1 Define analysis paths
+
+```{r discover_define_paths}
+# Three roots: per-run R-derived tables (analysis_root), the Python parquet exports
+# (export_root), and where pooled cohort tables get written (cohort_output_root).
+analysis_root <- here::here("results", "R_ANALYSIS")
+export_root   <- here::here("results", "DATA_EXPORT")
+cohort_output_root <- file.path(analysis_root, "cohort")
+```
+
+## 2.2 List run folders
+
+Runs are pooled from the shared `cohort_final` block so all cohort notebooks use the same sample.
+
+```{r discover_list_run_folders}
+# Load the subset registry, then pull the cohort_final run list: the four-way modality
+# intersection minus quality exclusions, computed by multimodal_subset_checker.R. Sorting
+# keeps the run order identical across all notebooks.
+subset_registry <- arrow::read_parquet(
+  file.path(analysis_root, "subset_registry", "multimodal_subset_registry.parquet")
+)
+
+run_ids <- subset_registry |>
+  dplyr::filter(.data$analysis_block == "cohort_final", .data$included == 1L) |>
+  dplyr::pull(.data$RUN_ID) |>
+  sort()
+
+cat("Cohort N (cohort_final):", length(run_ids), "\n")
+run_ids
+```
+
+# 3. Pool run-level derived tables
+
+Each chunk in this section reads one per-run export for every run in the cohort and stacks
+them (`bind_rows`) into a single pooled table. EX_DYN tables are capped at 60 reps; nothing
+else is transformed here -- this section is pooling only.
+
+## 3.1 Run metadata
+
+```{r pool_run_metadata}
+# Run metadata: one row per run (sex, mass, dominant side, mvc_ref, ...).
+cohort_run_metadata_table <- dplyr::bind_rows(
+  lapply(run_ids, function(run_id) {
+    read_parquet(file.path(analysis_root, run_id, "run_metadata.parquet"))
+  })
+) |>
+  dplyr::arrange(RUN_ID)
+
+cohort_run_metadata_table
+```
+
+## 3.2 Reference-level feature table
+
+```{r pool_reference_level_feature_table_norm}
+# Reference-level features: the 30/50/70/100% calibration points, normalized to MVC_REF.
+cohort_reference_level_feature_table_norm <- dplyr::bind_rows(
+  lapply(run_ids, function(run_id) {
+    read_parquet(file.path(analysis_root, run_id, "reference_level_feature_table_norm.parquet"))
+  })
+) |>
+  dplyr::arrange(RUN_ID, channel, reference_level_id)
+```
+
+## 3.3 EX_DYN middle-1s feature table
+
+```{r pool_ex_dyn_mid1s_feature_table_norm}
+# EX_DYN per-rep features (nRMS / nMDF / nTorque), capped at the common 60-rep window.
+cohort_ex_dyn_mid1s_feature_table_norm <- dplyr::bind_rows(
+  lapply(run_ids, function(run_id) {
+    read_parquet(file.path(analysis_root, run_id, "ex_dyn_mid1s_feature_table_norm.parquet"))
+  })
+) |>
+  dplyr::filter(VC_count <= 60L) |>
+  dplyr::arrange(RUN_ID, channel, VC_count)
+```
+
+## 3.4 EX_STA middle-1s feature table
+
+```{r pool_ex_sta_mid1s_feature_table_norm}
+# EX_STA per-window features (one row per 1 s window), normalized.
+cohort_ex_sta_mid1s_feature_table_norm <- dplyr::bind_rows(
+  lapply(run_ids, function(run_id) {
+    read_parquet(file.path(analysis_root, run_id, "ex_sta_mid1s_feature_table_norm.parquet"))
+  })
+) |>
+  dplyr::arrange(RUN_ID, channel, window_id)
+```
+
+## 3.5 EX_DYN EMG-to-torque ratio table
+
+```{r pool_ex_dyn_emg_torque_ratio_table}
+# EX_DYN EMG/torque ratio (nRMS / nTorque) per rep, capped at 60 reps.
+cohort_ex_dyn_emg_torque_ratio_table <- dplyr::bind_rows(
+  lapply(run_ids, function(run_id) {
+    read_parquet(file.path(analysis_root, run_id, "ex_dyn_emg_torque_ratio_table.parquet"))
+  })
+) |>
+  dplyr::filter(VC_count <= 60L) |>
+  dplyr::arrange(RUN_ID, channel, VC_count)
+```
+
+## 3.6 EX_STA EMG-to-torque ratio table
+
+```{r pool_ex_sta_emg_torque_ratio_table}
+# EX_STA EMG/torque ratio per 1 s window.
+cohort_ex_sta_emg_torque_ratio_table <- dplyr::bind_rows(
+  lapply(run_ids, function(run_id) {
+    read_parquet(file.path(analysis_root, run_id, "ex_sta_emg_torque_ratio_table.parquet"))
+  })
+) |>
+  dplyr::arrange(RUN_ID, channel, window_id)
+```
+
+## 3.7 EMG-to-torque ratio slope summary table
+
+```{r pool_emg_torque_ratio_slope_summary_table}
+# Per-run ratio-slope fits: one slope/intercept/R2 per run x sequence x channel.
+cohort_emg_torque_ratio_slope_summary_table <- dplyr::bind_rows(
+  lapply(run_ids, function(run_id) {
+    read_parquet(file.path(analysis_root, run_id, "emg_torque_ratio_slope_summary_table.parquet"))
+  })
+) |>
+  dplyr::arrange(SEQ, channel, RUN_ID)
+```
+
+## 3.8 Reference calibration table in normalized space
+
+```{r pool_reference_calibration_table_norm}
+# Per-run reference calibration: the pre-fatigue nRMS ~ nTorque fit (slope/intercept/R2).
+cohort_reference_calibration_table_norm <- dplyr::bind_rows(
+  lapply(run_ids, function(run_id) {
+    read_parquet(file.path(analysis_root, run_id, "reference_calibration_table_norm.parquet"))
+  })
+) |>
+  dplyr::arrange(channel, RUN_ID)
+```
+
+# 4. Add metadata-enriched cohort tables
+
+Both chunks below left-join the run metadata (sex, mass, dominant side, ...) onto a pooled
+table, so downstream tables and plots can break results down by participant characteristics.
+
+## 4.1 EMG-to-torque ratio slope summary with metadata
+
+```{r enrich_emg_torque_ratio_slope_summary_with_metadata}
+# Attach run metadata so ratio slopes can be split by sex / practice level / etc.
+cohort_emg_torque_ratio_slope_summary_with_metadata <- cohort_emg_torque_ratio_slope_summary_table |>
+  dplyr::left_join(
+    cohort_run_metadata_table,
+    by = c("RUN_ID", "participant_id")
+  ) |>
+  dplyr::arrange(SEQ, channel, RUN_ID)
+```
+
+## 4.2 Reference calibration table with metadata
+
+```{r enrich_reference_calibration_table_norm_with_metadata}
+# Same metadata join for the per-run calibration fits.
+cohort_reference_calibration_table_norm_with_metadata <- cohort_reference_calibration_table_norm |>
+  dplyr::left_join(
+    cohort_run_metadata_table,
+    by = c("RUN_ID", "participant_id")
+  ) |>
+  dplyr::arrange(channel, RUN_ID)
+```
+
+# 5. Write cohort outputs
+
+## 5.1 Export control
+
+```{r write_export_control}
+# Export switches, both OFF by default -- the notebook analyses from in-memory tables.
+# Flip EXPORT_COHORT_PARQUET to (re)write the pooled parquets.
+EXPORT_COHORT_PARQUET        <- FALSE
+EXPORT_TORQUE_TIMELINE_PDF   <- FALSE   # §8.6 -> set TRUE to refresh results/QC_EXPORT/torque_timeline*.pdf
+```
+
+## 5.2 Create output folder when export is enabled
+
+```{r write_create_output_folder}
+# Make the cohort output folder only when we're actually exporting.
+if (isTRUE(EXPORT_COHORT_PARQUET)) {
+  dir.create(cohort_output_root, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+## 5.3 Export pooled cohort parquet tables
+
+```{r write_export_cohort_parquet_tables}
+# Write every pooled table (raw + metadata-enriched) to the cohort folder.
+if (isTRUE(EXPORT_COHORT_PARQUET)) {
+  write_parquet(cohort_run_metadata_table,
+                sink = file.path(cohort_output_root, "cohort_run_metadata.parquet"))
+  write_parquet(cohort_reference_level_feature_table_norm,
+                sink = file.path(cohort_output_root, "cohort_reference_level_feature_table_norm.parquet"))
+  write_parquet(cohort_ex_dyn_mid1s_feature_table_norm,
+                sink = file.path(cohort_output_root, "cohort_ex_dyn_mid1s_feature_table_norm.parquet"))
+  write_parquet(cohort_ex_sta_mid1s_feature_table_norm,
+                sink = file.path(cohort_output_root, "cohort_ex_sta_mid1s_feature_table_norm.parquet"))
+  write_parquet(cohort_ex_dyn_emg_torque_ratio_table,
+                sink = file.path(cohort_output_root, "cohort_ex_dyn_emg_torque_ratio_table.parquet"))
+  write_parquet(cohort_ex_sta_emg_torque_ratio_table,
+                sink = file.path(cohort_output_root, "cohort_ex_sta_emg_torque_ratio_table.parquet"))
+  write_parquet(cohort_emg_torque_ratio_slope_summary_table,
+                sink = file.path(cohort_output_root, "cohort_emg_torque_ratio_slope_summary_table.parquet"))
+  write_parquet(cohort_reference_calibration_table_norm,
+                sink = file.path(cohort_output_root, "cohort_reference_calibration_table_norm.parquet"))
+  write_parquet(cohort_emg_torque_ratio_slope_summary_with_metadata,
+                sink = file.path(cohort_output_root, "cohort_emg_torque_ratio_slope_summary_with_metadata.parquet"))
+  write_parquet(cohort_reference_calibration_table_norm_with_metadata,
+                sink = file.path(cohort_output_root, "cohort_reference_calibration_table_norm_with_metadata.parquet"))
+}
+```
+
+# 6. Cohort analysis scaffold
+
+## 6.0 Plot style
+
+```{r cohort_plot_style}
+# Shared cohort palette + theme (half-open frame, horizontal gridlines only, outward ticks).
+col_rms          <- "#3d6b99"
+col_mdf          <- "#a0682a"
+col_ref_fill     <- "#888888"
+col_neutral_data <- "#4d4d4d"
+col_torque       <- "#2e6b8a"
+
+# Internal channel IDs -> muscle labels, used in plot facets only.
+channel_display_labels <- c(emg6 = "RF", emg8 = "VM", emg10 = "VL")
+
+theme_amstrom_hgrid <- theme_bw(base_size = 13) +
+  theme(
+    panel.grid.major.x          = element_blank(),
+    panel.grid.minor            = element_blank(),
+    panel.grid.major.y          = element_line(colour = "grey91", linewidth = 0.35),
+    panel.border                = element_blank(),
+    axis.line.x.bottom          = element_line(colour = "grey55", linewidth = 0.4),
+    axis.line.y.left            = element_line(colour = "grey55", linewidth = 0.4),
+    strip.background            = element_blank(),
+    strip.text                  = element_text(face = "bold", size = rel(0.88)),
+    legend.position             = "top",
+    legend.key.size             = unit(0.8, "lines"),
+    legend.text                 = element_text(size = rel(0.88)),
+    axis.ticks                  = element_line(colour = "grey55", linewidth = 0.4),
+    axis.ticks.length.x.bottom  = unit(3.5, "pt"),
+    axis.ticks.length.y.left    = unit(3.5, "pt"),
+    panel.spacing               = unit(3, "pt")
+  )
+```
+
+## 6.1 Use pooled cohort tables for downstream analysis
+
+```{r cohort_analysis_read_inputs}
+# Alias the pooled tables under *_analysis names. Everything below reads these aliases, so the pooling step and the analysis stay decoupled (inputs can be swapped here without touching plots)
+cohort_run_metadata_analysis <- cohort_run_metadata_table
+cohort_reference_level_feature_table_norm_analysis <- cohort_reference_level_feature_table_norm
+cohort_ex_dyn_mid1s_feature_table_norm_analysis <- cohort_ex_dyn_mid1s_feature_table_norm
+cohort_ex_sta_mid1s_feature_table_norm_analysis <- cohort_ex_sta_mid1s_feature_table_norm
+cohort_ex_dyn_emg_torque_ratio_table_analysis <- cohort_ex_dyn_emg_torque_ratio_table
+cohort_ex_sta_emg_torque_ratio_table_analysis <- cohort_ex_sta_emg_torque_ratio_table
+cohort_emg_torque_ratio_slope_summary_table_analysis <- cohort_emg_torque_ratio_slope_summary_with_metadata
+cohort_reference_calibration_table_norm_analysis <- cohort_reference_calibration_table_norm_with_metadata
+```
+
+## 6.3 Quick cohort data check
+
+```{r cohort_analysis_quick_data_check}
+# Row-count check on every analysis table before any plotting/summary
+tibble::tibble(
+  table_name = c(
+    "cohort_run_metadata_analysis",
+    "cohort_reference_level_feature_table_norm_analysis",
+    "cohort_ex_dyn_mid1s_feature_table_norm_analysis",
+    "cohort_ex_sta_mid1s_feature_table_norm_analysis",
+    "cohort_ex_dyn_emg_torque_ratio_table_analysis",
+    "cohort_ex_sta_emg_torque_ratio_table_analysis",
+    "cohort_emg_torque_ratio_slope_summary_table_analysis",
+    "cohort_reference_calibration_table_norm_analysis"
+  ),
+  n_rows = c(
+    nrow(cohort_run_metadata_analysis),
+    nrow(cohort_reference_level_feature_table_norm_analysis),
+    nrow(cohort_ex_dyn_mid1s_feature_table_norm_analysis),
+    nrow(cohort_ex_sta_mid1s_feature_table_norm_analysis),
+    nrow(cohort_ex_dyn_emg_torque_ratio_table_analysis),
+    nrow(cohort_ex_sta_emg_torque_ratio_table_analysis),
+    nrow(cohort_emg_torque_ratio_slope_summary_table_analysis),
+    nrow(cohort_reference_calibration_table_norm_analysis)
+  )
+)
+```
+
+## 6.4 Cohort EMG analysis checks
+
+The descriptive tables in 6.4.2-6.4.6 each group a pooled feature table by channel (and
+sequence) and summarise mean/SD of the normalized metrics -- QC summaries, printed only when
+`SHOW_COHORT_TABLES = TRUE`. 6.4.7 builds the cohort-mean tables the plots consume, and 6.4.8
+draws the trajectory figures (all on the focus channel, VL).
+
+### 6.4.1 Analysis selection
+
+```{r cohort_analysis_feature_selection}
+selected_sequences <- c("EX_DYN", "EX_STA")
+selected_channels  <- c("emg6", "emg8", "emg10")
+# VL (emg10) is the focus channel for cohort plots (for now!)
+# Computations keep all channels; only plots filter to plot_channel.
+plot_channel <- "emg10"
+# These flags only take effect when the eval=TRUE plot/table chunks are enabled.
+SHOW_COHORT_TABLES   <- FALSE
+SHOW_COHORT_PLOTS    <- TRUE
+PRINT_SUMMARY_TABLES <- FALSE
+
+selected_sequences
+selected_channels
+SHOW_COHORT_TABLES
+SHOW_COHORT_PLOTS
+```
+
+### 6.4.2 Included runs and participants
+
+```{r cohort_analysis_included_runs_table, eval=TRUE}
+# Participant characteristics for the included runs (one row per run).
+cohort_included_runs_table <- cohort_run_metadata_analysis |>
+  dplyr::arrange(participant_id, RUN_ID) |>
+  dplyr::select(
+    RUN_ID,
+    participant_id,
+    sex,
+    dominant_side,
+    practice_level,
+    height_cm,
+    mass_kg,
+    mvc_ref
+  )
+
+if (isTRUE(SHOW_COHORT_TABLES)) {
+  print(cohort_included_runs_table)
+}
+```
+
+### 6.4.3 Reference-level descriptive table
+
+```{r cohort_analysis_reference_level_summary_table, eval=TRUE}
+# Reference-level QC summary: cohort mean/SD of nTorque, nRMS, nMDF at each intensity, per channel.
+cohort_reference_level_summary_table <- cohort_reference_level_feature_table_norm_analysis |>
+  dplyr::filter(channel %in% selected_channels) |>
+  dplyr::group_by(channel, reference_level) |>
+  dplyr::summarise(
+    n_rows = dplyr::n(),                                 # rows pooled into this cell
+    n_runs = dplyr::n_distinct(RUN_ID),                  # distinct runs contributing
+    mean_torque_norm = mean(torque_norm, na.rm = TRUE),  # cohort mean nTorque
+    sd_torque_norm = sd(torque_norm, na.rm = TRUE),      # between-run SD
+    mean_rms_norm = mean(rms_norm, na.rm = TRUE),        # cohort mean nRMS
+    sd_rms_norm = sd(rms_norm, na.rm = TRUE),
+    mean_mdf_norm = mean(mdf_norm, na.rm = TRUE),        # cohort mean nMDF
+    sd_mdf_norm   = sd(mdf_norm,   na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(channel, reference_level)
+
+if (isTRUE(SHOW_COHORT_TABLES)) {
+  print(cohort_reference_level_summary_table)
+}
+```
+
+### 6.4.4 EX_DYN ratio descriptive table
+
+```{r cohort_analysis_ex_dyn_ratio_summary_table, eval=TRUE}
+# EX_DYN EMG/torque ratio summary: cohort mean/SD per channel (observed vs expected ratio).
+cohort_ex_dyn_ratio_summary_table <- cohort_ex_dyn_emg_torque_ratio_table_analysis |>
+  dplyr::filter(
+    SEQ %in% selected_sequences,
+    channel %in% selected_channels
+  ) |>
+  dplyr::group_by(SEQ, channel) |>
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    n_runs = dplyr::n_distinct(RUN_ID),
+    mean_ratio = mean(emg_torque_ratio, na.rm = TRUE),        # cohort mean EMG/torque ratio
+    sd_ratio = sd(emg_torque_ratio, na.rm = TRUE),            # between-run SD
+    mean_expected_ratio = mean(expected_ratio, na.rm = TRUE), # ratio the fresh calibration predicts
+    mean_torque_norm = mean(torque_norm, na.rm = TRUE),       # mean nTorque at this point
+    mean_rms_norm = mean(rms_norm, na.rm = TRUE),             # mean nRMS at this point
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(SEQ, channel)
+
+if (isTRUE(SHOW_COHORT_TABLES)) {
+  print(cohort_ex_dyn_ratio_summary_table)
+}
+```
+
+### 6.4.5 EX_STA ratio descriptive table
+
+```{r cohort_analysis_ex_sta_ratio_summary_table, eval=TRUE}
+# Same ratio summary as 6.4.4 but for EX_STA.
+cohort_ex_sta_ratio_summary_table <- cohort_ex_sta_emg_torque_ratio_table_analysis |>
+  dplyr::filter(
+    SEQ %in% selected_sequences,
+    channel %in% selected_channels
+  ) |>
+  dplyr::group_by(SEQ, channel) |>
+  dplyr::summarise(
+    n_rows = dplyr::n(),
+    n_runs = dplyr::n_distinct(RUN_ID),
+    mean_ratio = mean(emg_torque_ratio, na.rm = TRUE),        # cohort mean EMG/torque ratio
+    sd_ratio = sd(emg_torque_ratio, na.rm = TRUE),            # between-run SD
+    mean_expected_ratio = mean(expected_ratio, na.rm = TRUE), # ratio the fresh calibration predicts
+    mean_torque_norm = mean(torque_norm, na.rm = TRUE),       # mean nTorque at this point
+    mean_rms_norm = mean(rms_norm, na.rm = TRUE),             # mean nRMS at this point
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(SEQ, channel)
+
+if (isTRUE(SHOW_COHORT_TABLES)) {
+  print(cohort_ex_sta_ratio_summary_table)
+}
+```
+
+### 6.4.6 Ratio slope summary table
+
+```{r cohort_analysis_ratio_slope_summary_table, eval=TRUE}
+# Per-run ratio-slope fits, narrowed to the analysis sequences/channels for display.
+cohort_ratio_slope_summary_table <- cohort_emg_torque_ratio_slope_summary_table_analysis |>
+  dplyr::filter(
+    SEQ %in% selected_sequences,
+    channel %in% selected_channels
+  ) |>
+  dplyr::arrange(SEQ, channel, participant_id, RUN_ID) |>
+  dplyr::select(
+    RUN_ID,
+    participant_id,
+    sex,
+    SEQ,
+    channel,
+    time_index_variable,
+    slope_estimate,
+    intercept,
+    r_squared,
+    n_points,
+    fit_type
+  )
+
+if (isTRUE(SHOW_COHORT_TABLES)) {
+  print(cohort_ratio_slope_summary_table)
+}
+```
+
+
+### 6.4.7 Cohort-ready plotting tables
+
+```{r cohort_analysis_plot_styling_tables, eval=TRUE}
+# Pre-aggregate cohort mean per (channel, VC_count) for the trajectory plots, carrying both
+# the SEM and the SD band (sd_low/sd_high). The trajectory plots draw the SD band.
+cohort_ex_dyn_ratio_plot_table <- cohort_ex_dyn_emg_torque_ratio_table_analysis |>
+  dplyr::filter(
+    SEQ == "EX_DYN",
+    channel %in% selected_channels
+  )
+
+cohort_ex_dyn_ratio_mean_table <- cohort_ex_dyn_ratio_plot_table |>
+  dplyr::group_by(channel, VC_count) |>
+  dplyr::summarise(
+    n_runs = sum(is.finite(emg_torque_ratio)),                               # runs contributing to this rep
+    mean_emg_torque_ratio  = mean(emg_torque_ratio,  na.rm = TRUE),          # cohort mean ratio
+    sd_emg_torque_ratio    = sd(emg_torque_ratio,    na.rm = TRUE),          # between-run SD
+    sem_emg_torque_ratio   = sd_emg_torque_ratio / sqrt(n_runs),             # std error (carried, not plotted)
+    sd_low_emg_torque_ratio  = mean_emg_torque_ratio - sd_emg_torque_ratio,  # SD band lower bound
+    sd_high_emg_torque_ratio = mean_emg_torque_ratio + sd_emg_torque_ratio,  # SD band upper bound
+    mean_expected_ratio    = mean(expected_ratio,     na.rm = TRUE),         # ratio predicted by fresh calibration
+    .groups = "drop"
+  )
+
+cohort_ex_dyn_rms_plot_table <- cohort_ex_dyn_mid1s_feature_table_norm_analysis |>
+  dplyr::filter(
+    SEQ == "EX_DYN",
+    channel %in% selected_channels
+  )
+
+cohort_ex_dyn_rms_mean_table <- cohort_ex_dyn_rms_plot_table |>
+  dplyr::group_by(channel, VC_count) |>
+  dplyr::summarise(
+    n_runs = sum(is.finite(rms_norm)),             # runs contributing to this rep
+    mean_rms_norm = mean(rms_norm, na.rm = TRUE),  # cohort mean nRMS
+    sd_rms_norm = sd(rms_norm, na.rm = TRUE),      # between-run SD
+    sem_rms_norm = sd_rms_norm / sqrt(n_runs),     # std error (carried, not plotted)
+    sd_low_rms_norm = mean_rms_norm - sd_rms_norm,  # SD band lower bound
+    sd_high_rms_norm = mean_rms_norm + sd_rms_norm, # SD band upper bound
+    .groups = "drop"
+  )
+
+cohort_ex_dyn_mdf_mean_table <- cohort_ex_dyn_rms_plot_table |>
+  dplyr::group_by(channel, VC_count) |>
+  dplyr::summarise(
+    n_runs         = sum(is.finite(mdf_norm)),      # runs contributing to this rep
+    mean_mdf_norm  = mean(mdf_norm, na.rm = TRUE),  # cohort mean nMDF
+    sd_mdf_norm    = sd(mdf_norm,   na.rm = TRUE),  # between-run SD
+    sem_mdf_norm   = sd_mdf_norm / sqrt(n_runs),    # std error (carried, not plotted)
+    sd_low_mdf_norm  = mean_mdf_norm - sd_mdf_norm,  # SD band lower bound
+    sd_high_mdf_norm = mean_mdf_norm + sd_mdf_norm,  # SD band upper bound
+    .groups = "drop"
+  )
+```
+
+### 6.4.8 Cohort plots
+
+All plots below share the house style (`theme_amstrom_hgrid`, mean +/- SD error bars, dotted
+connectors, y-axis rescaled to % MVC) and are filtered to the focus channel (VL); each draws
+one slice of the cohort fatigue story.
+
+#### 6.4.8.1 EX_DYN cohort ratio trajectories - all participants
+
+```{r cohort_analysis_ex_dyn_ratio_plot_all, eval=TRUE, fig.width=6, fig.height=5}
+# Plot: EX_DYN EMG/torque ratio trajectory (VL), cohort mean +/- SD over repetitions.
+cohort_ex_dyn_ratio_plot_all <- ggplot(
+  cohort_ex_dyn_ratio_mean_table |> dplyr::filter(channel == plot_channel),
+  aes(x = VC_count, y = mean_emg_torque_ratio)
+) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # 100% MVC reference (normalized = 1.0)
+  geom_errorbar(
+    aes(ymin = mean_emg_torque_ratio - sd_emg_torque_ratio,
+        ymax = mean_emg_torque_ratio + sd_emg_torque_ratio),
+    width = 0, colour = col_neutral_data, linewidth = 0.4, alpha = 0.28
+  ) +
+  geom_line(colour = col_neutral_data, linetype = "dotted", linewidth = 0.35) +
+  geom_point(colour = col_neutral_data, shape = 15, size = 2.2) +
+  labs(
+    title    = "Cohort EX_DYN - EMG/torque ratio over repetitions - VL",
+    subtitle = "Cohort mean ± SD",
+    x = "Repetition",
+    y = "EMG/torque ratio (%)"
+  ) +
+  scale_y_continuous(labels = function(x) round(x * 100), expand = expansion(mult = c(0.05, 0.05))) +
+  coord_cartesian(clip = "off") +
+  theme_amstrom_hgrid
+```
+
+
+
+
+
+
+#### 6.4.8.7 EX_DYN combined fatigue trajectory (RMS, MDF, ratio)
+
+```{r cohort_analysis_ex_dyn_combined_line, eval=TRUE, fig.width=6, fig.height=8}
+# Stack the three EX_DYN metric means (nRMS, nMDF, ratio) into one long table, then draw a
+# 3-row faceted trajectory (VL) with inline metric labels at each panel's lower-left.
+cohort_ex_dyn_combined_long <- dplyr::bind_rows(
+  cohort_ex_dyn_rms_mean_table |>
+    dplyr::transmute(
+      channel, VC_count,
+      metric   = "nRMS",
+      mean_val = mean_rms_norm,
+      sd_low   = mean_rms_norm - sd_rms_norm,
+      sd_high  = mean_rms_norm + sd_rms_norm
+    ),
+  cohort_ex_dyn_mdf_mean_table |>
+    dplyr::transmute(
+      channel, VC_count,
+      metric   = "nMDF",
+      mean_val = mean_mdf_norm,
+      sd_low   = mean_mdf_norm - sd_mdf_norm,
+      sd_high  = mean_mdf_norm + sd_mdf_norm
+    ),
+  cohort_ex_dyn_ratio_mean_table |>
+    dplyr::transmute(
+      channel, VC_count,
+      metric   = "EMG/torque ratio",
+      mean_val = mean_emg_torque_ratio,
+      sd_low   = mean_emg_torque_ratio - sd_emg_torque_ratio,
+      sd_high  = mean_emg_torque_ratio + sd_emg_torque_ratio
+    )
+) |>
+  dplyr::filter(channel == plot_channel) |>
+  dplyr::mutate(metric = factor(metric, levels = c("nRMS", "nMDF", "EMG/torque ratio")))
+
+cohort_ex_dyn_combined_fatigue_plot <- ggplot(
+  cohort_ex_dyn_combined_long,
+  aes(x = VC_count, y = mean_val)
+) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # 100% MVC reference (normalized = 1.0)
+  geom_errorbar(aes(ymin = sd_low, ymax = sd_high, colour = metric), width = 0, linewidth = 0.4, alpha = 0.28) +
+  geom_line(aes(colour = metric), linetype = "dotted", linewidth = 0.35) +
+  geom_point(aes(colour = metric), shape = 15, size = 2.2) +
+  geom_text(
+    data = dplyr::distinct(cohort_ex_dyn_combined_long, metric) |>
+             dplyr::mutate(VC_count = -Inf, mean_val = -Inf),
+    aes(x = VC_count, y = mean_val, label = metric, colour = metric),
+    hjust = -0.1, vjust = -0.35, fontface = "bold", size = 3.2,
+    inherit.aes = FALSE
+  ) +
+  scale_colour_manual(
+    values = c("nRMS" = col_rms, "nMDF" = col_mdf, "EMG/torque ratio" = col_neutral_data),
+    guide  = "none"
+  ) +
+  facet_wrap(~ metric, ncol = 1, scales = "free_y") +
+  labs(
+    title    = "Cohort EX_DYN - Fatigue progression: nRMS, nMDF, EMG/torque ratio - VL",
+    subtitle = "Cohort mean ± SD",
+    x        = "Repetition",
+    y        = NULL
+  ) +
+  scale_y_continuous(labels = function(x) round(x * 100), expand = expansion(mult = c(0.05, 0.05))) +
+  coord_cartesian(clip = "off") +
+  theme_amstrom_hgrid +
+  theme(strip.background = element_blank(), strip.text = element_blank())
+```
+
+```{r cohort_analysis_ex_dyn_triple_ratio, eval=TRUE, fig.width=6, fig.height=5}
+# Plot: same three metrics overlaid in a single panel (not faceted), VL.
+cohort_ex_dyn_triple_ratio_plot <- ggplot(
+  cohort_ex_dyn_combined_long,
+  aes(x = VC_count, y = mean_val, colour = metric)
+) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # 100% MVC reference (normalized = 1.0)
+  geom_errorbar(
+    aes(ymin = sd_low, ymax = sd_high),
+    width = 0, linewidth = 0.4, alpha = 0.28
+  ) +
+  geom_line(linetype = "dotted", linewidth = 0.35) +
+  geom_point(shape = 15, size = 2.2) +
+  scale_colour_manual(
+    values = c("nRMS" = col_rms, "nMDF" = col_mdf, "EMG/torque ratio" = col_neutral_data),
+    name   = NULL
+  ) +
+  scale_y_continuous(labels = function(x) round(x * 100), expand = expansion(mult = c(0.05, 0.05))) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title    = "Cohort EX_DYN - nRMS, nMDF, EMG/torque ratio - VL",
+    subtitle = "Cohort mean ± SD",
+    x        = "Repetition",
+    y        = "% MVC"
+  ) +
+  theme_amstrom_hgrid +
+  theme(
+    legend.position      = c(0.02, 0.97),
+    legend.justification = c(0, 1),
+    legend.background    = element_rect(fill = NA, colour = NA),
+    legend.key           = element_rect(fill = NA)
+  )
+
+cohort_ex_dyn_triple_ratio_plot
+```
+
+```{r cohort_analysis_ex_dyn_triple_torque, eval=TRUE, fig.width=6, fig.height=5}
+# Plot: nTorque + nRMS + nMDF overlaid (VL). Builds the torque mean table first to match.
+cohort_ex_dyn_torque_mean_table <- cohort_ex_dyn_rms_plot_table |>
+  dplyr::group_by(channel, VC_count) |>
+  dplyr::summarise(
+    mean_torque_norm = mean(torque_norm, na.rm = TRUE),
+    sd_torque_norm   = sd(torque_norm,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cohort_ex_dyn_triple_torque_long <- dplyr::bind_rows(
+  cohort_ex_dyn_torque_mean_table |>
+    dplyr::transmute(channel, VC_count,
+                     metric   = "nTorque",
+                     mean_val = mean_torque_norm,
+                     sd_low   = mean_torque_norm - sd_torque_norm,
+                     sd_high  = mean_torque_norm + sd_torque_norm),
+  cohort_ex_dyn_rms_mean_table |>
+    dplyr::transmute(channel, VC_count,
+                     metric   = "nRMS",
+                     mean_val = mean_rms_norm,
+                     sd_low   = mean_rms_norm - sd_rms_norm,
+                     sd_high  = mean_rms_norm + sd_rms_norm),
+  cohort_ex_dyn_mdf_mean_table |>
+    dplyr::transmute(channel, VC_count,
+                     metric   = "nMDF",
+                     mean_val = mean_mdf_norm,
+                     sd_low   = mean_mdf_norm - sd_mdf_norm,
+                     sd_high  = mean_mdf_norm + sd_mdf_norm)
+) |>
+  dplyr::filter(channel == plot_channel) |>
+  dplyr::mutate(metric = factor(metric, levels = c("nTorque", "nRMS", "nMDF")))
+
+cohort_ex_dyn_triple_torque_plot <- ggplot(
+  cohort_ex_dyn_triple_torque_long,
+  aes(x = VC_count, y = mean_val, colour = metric)
+) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey72", linewidth = 0.4) +  # 100% MVC reference (normalized = 1.0)
+  geom_errorbar(
+    aes(ymin = sd_low, ymax = sd_high),
+    width = 0, linewidth = 0.4, alpha = 0.28
+  ) +
+  geom_line(linetype = "dotted", linewidth = 0.35) +
+  geom_point(shape = 15, size = 2.2) +
+  scale_colour_manual(
+    values = c("nTorque" = col_torque, "nRMS" = col_rms, "nMDF" = col_mdf),
+    name   = NULL
+  ) +
+  scale_y_continuous(labels = function(x) round(x * 100), expand = expansion(mult = c(0.05, 0.05))) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title    = "Cohort EX_DYN - nTorque, nRMS, nMDF - VL",
+    subtitle = "Cohort mean ± SD",
+    x        = "Repetition",
+    y        = "% MVC"
+  ) +
+  theme_amstrom_hgrid +
+  theme(
+    legend.position      = c(0.02, 0.97),
+    legend.justification = c(0, 1),
+    legend.background    = element_rect(fill = NA, colour = NA),
+    legend.key           = element_rect(fill = NA)
+  )
+
+cohort_ex_dyn_triple_torque_plot
+```
+
+#### 6.4.8.12 Cohort RMS across intensity levels
+
+```{r cohort_rms_calibration_boxplot, eval=TRUE, fig.width=6, fig.height=5}
+# Plot: nRMS across the 30/50/70/100% reference levels -- grey individual runs + cohort-mean line.
+cohort_rms_calib_plot_table <- cohort_reference_level_feature_table_norm_analysis |>
+  dplyr::filter(channel == plot_channel, SEQ %in% c("SVC_REF", "MVC_REF")) |>
+  dplyr::mutate(
+    reference_level = factor(reference_level, levels = c("30%", "50%", "70%", "100%"))
+  )
+
+cohort_rms_calibration_boxplot <- ggplot(
+  cohort_rms_calib_plot_table,
+  aes(x = reference_level, y = rms_norm)
+) +
+  geom_line(
+    aes(group = RUN_ID),
+    color = col_neutral_data, alpha = 0.25, linewidth = 0.7
+  ) +
+  geom_point(
+    aes(group = RUN_ID),
+    color = col_neutral_data, alpha = 0.35, size = 1.5
+  ) +
+  stat_summary(fun = mean, geom = "line",  aes(group = 1), color = col_rms, linewidth = 1.2) +
+  stat_summary(fun = mean, geom = "point", aes(group = 1), color = col_rms, size = 2.5) +
+  scale_y_continuous(labels = function(x) round(x * 100), expand = expansion(mult = c(0.05, 0.05))) +
+  labs(
+    title    = "Cohort - nRMS across intensity levels - VL",
+    subtitle = "Coloured line = cohort mean; grey = individual runs",
+    x        = "Reference intensity level",
+    y        = "nRMS (%)"
+  ) +
+  theme_amstrom_hgrid
+```
+
+#### 6.4.8.11 Cohort MDF across intensity levels
+
+```{r cohort_mdf_calibration_boxplot, eval=TRUE, fig.width=6, fig.height=5}
+# Plot: MDF across reference levels as boxplots (kept in raw Hz on purpose, calibration QC).
+cohort_mdf_calib_plot_table <- cohort_reference_level_feature_table_norm_analysis |>
+  dplyr::filter(channel == plot_channel, SEQ %in% c("SVC_REF", "MVC_REF")) |>
+  dplyr::mutate(
+    reference_level = factor(reference_level, levels = c("30%", "50%", "70%", "100%"))
+  )
+
+cohort_mdf_calibration_boxplot <- ggplot(
+  cohort_mdf_calib_plot_table,
+  aes(x = reference_level, y = mdf_mid_1s_hz)
+) +
+  geom_boxplot(
+    width          = 0.55,
+    fill           = "white",
+    colour         = col_mdf,
+    linewidth      = 0.5,
+    outlier.shape  = 1,
+    outlier.size   = 1.8,
+    outlier.colour = col_mdf
+  ) +
+  labs(
+    title    = "Cohort - MDF across intensity levels - VL (Hz, calibration QC)",
+    subtitle = "Distribution across runs per intensity level",
+    x        = "Reference intensity level",
+    y        = "Median frequency (Hz)"
+  ) +
+  theme_amstrom_hgrid
+```
+
+#### 6.4.8.12 nRMS vs nTorque fatigue cloud and mean trajectory
+
+```{r cohort_ex_dyn_rms_torque_prep}
+# Build the nRMS-vs-nTorque "fatigue cloud" reference: per-run calibration fits, their mean
+# line + SD band, and the cohort-mean anchor dots at each fresh intensity level.
+cohort_ref_data_vl <- cohort_reference_level_feature_table_norm_analysis |>
+  dplyr::filter(
+    channel == plot_channel,
+    SEQ %in% c("SVC_REF", "MVC_REF"),
+    is.finite(torque_norm),
+    is.finite(rms_norm)
+  )
+
+# One slope + intercept per participant from their 4-point fresh calibration (30/50/70/100%)
+cohort_ref_per_run_fits <- cohort_ref_data_vl |>
+  dplyr::group_by(RUN_ID) |>
+  dplyr::summarise(
+    slope     = unname(coef(lm(rms_norm ~ torque_norm))[2]),
+    intercept = unname(coef(lm(rms_norm ~ torque_norm))[1]),
+    .groups   = "drop"
+  )
+
+# Cohort reference line = mean of individual slopes/intercepts
+# Band = ± SD across per-run predictions at each grid point
+cohort_ref_torque_range <- range(cohort_ref_data_vl$torque_norm, na.rm = TRUE)
+cohort_ref_grid <- tibble::tibble(
+  torque_norm = seq(cohort_ref_torque_range[1], cohort_ref_torque_range[2], length.out = 120)
+)
+
+cohort_ref_ci_df <- cohort_ref_per_run_fits |>
+  tidyr::crossing(cohort_ref_grid) |>
+  dplyr::mutate(pred = intercept + slope * torque_norm) |>
+  dplyr::group_by(torque_norm) |>
+  dplyr::summarise(
+    fit = mean(pred, na.rm = TRUE),
+    lwr = fit - sd(pred, na.rm = TRUE),
+    upr = fit + sd(pred, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Anchor dots: cohort-mean nRMS and nTorque at each fresh intensity level
+cohort_ref_intensity_dots <- cohort_ref_data_vl |>
+  dplyr::mutate(reference_level = factor(reference_level, levels = c("30%", "50%", "70%", "100%"))) |>
+  dplyr::group_by(reference_level) |>
+  dplyr::summarise(
+    mean_torque_norm = mean(torque_norm, na.rm = TRUE),
+    mean_rms_norm    = mean(rms_norm,    na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cohort_ex_dyn_vl <- cohort_ex_dyn_mid1s_feature_table_norm_analysis |>
+  dplyr::filter(channel == plot_channel)
+```
+
+```{r cohort_ex_dyn_rms_torque_cloud, fig.width=6, fig.height=5}
+# Plot: every EX_DYN rep as a point over the reference fit/band = shows where fatigued reps land relative to the fresh calibration.
+cohort_ex_dyn_rms_torque_cloud_plot <- ggplot() +
+  geom_ribbon(
+    data = cohort_ref_ci_df,
+    aes(x = torque_norm, ymin = lwr, ymax = upr),
+    fill = "grey85", alpha = 0.6, inherit.aes = FALSE
+  ) +
+  geom_line(
+    data = cohort_ref_ci_df,
+    aes(x = torque_norm, y = fit),
+    colour = "grey45", linewidth = 0.8, inherit.aes = FALSE
+  ) +
+  geom_point(
+    data = cohort_ref_intensity_dots,
+    aes(x = mean_torque_norm, y = mean_rms_norm),
+    colour = "grey25", size = 3.0, shape = 21, fill = "white", stroke = 1.1,
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = cohort_ref_intensity_dots,
+    aes(x = mean_torque_norm, y = mean_rms_norm, label = reference_level),
+    colour = "grey25", size = 3.0, vjust = -1.0,
+    inherit.aes = FALSE
+  ) +
+  geom_point(
+    data = cohort_ex_dyn_vl,
+    aes(x = torque_norm, y = rms_norm, colour = VC_count),
+    size = 0.8, alpha = 0.45
+  ) +
+  scale_colour_viridis_c(option = "plasma", direction = 1, name = "Repetition",
+                         breaks = c(1, 15, 30, 45, 60)) +
+  expand_limits(y = 0) +
+  coord_cartesian(ylim = c(0, NA)) +
+  labs(
+    title = paste0("EX_DYN - nRMS vs nTorque, all reps (N = ", length(run_ids), ")"),
+    subtitle = "Grey: mean of N=16 individual calibration fits (± SD).\nOpen circles: fresh reference at 30/50/70/100%.",
+    x = "nTorque (MVC_REF = 1)",
+    y = "nRMS (MVC_REF = 1)"
+  ) +
+  theme_amstrom_hgrid
+cohort_ex_dyn_rms_torque_cloud_plot
+```
+
+```{r cohort_ex_dyn_rms_torque_mean, fig.width=6, fig.height=5}
+# Plot: the same view as the cloud, but reduced to the cohort-mean rep-by-rep path.
+cohort_ex_dyn_vl_mean <- cohort_ex_dyn_vl |>
+  dplyr::group_by(VC_count) |>
+  dplyr::summarise(
+    mean_rms_norm    = mean(rms_norm,    na.rm = TRUE),
+    mean_torque_norm = mean(torque_norm, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(VC_count)
+
+cohort_ex_dyn_rms_torque_mean_plot <- ggplot() +
+  geom_ribbon(
+    data = cohort_ref_ci_df,
+    aes(x = torque_norm, ymin = lwr, ymax = upr),
+    fill = "grey85", alpha = 0.6, inherit.aes = FALSE
+  ) +
+  geom_line(
+    data = cohort_ref_ci_df,
+    aes(x = torque_norm, y = fit),
+    colour = "grey45", linewidth = 0.8, inherit.aes = FALSE
+  ) +
+  geom_point(
+    data = cohort_ref_intensity_dots,
+    aes(x = mean_torque_norm, y = mean_rms_norm),
+    colour = "grey25", size = 3.0, shape = 21, fill = "white", stroke = 1.1,
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = cohort_ref_intensity_dots,
+    aes(x = mean_torque_norm, y = mean_rms_norm, label = reference_level),
+    colour = "grey25", size = 3.0, vjust = -1.0,
+    inherit.aes = FALSE
+  ) +
+  geom_path(
+    data = cohort_ex_dyn_vl_mean,
+    aes(x = mean_torque_norm, y = mean_rms_norm, colour = VC_count),
+    linewidth = 0.7
+  ) +
+  geom_point(
+    data = cohort_ex_dyn_vl_mean,
+    aes(x = mean_torque_norm, y = mean_rms_norm, colour = VC_count),
+    size = 2.0
+  ) +
+  scale_colour_viridis_c(option = "plasma", direction = 1, name = "Repetition",
+                         breaks = c(1, 15, 30, 45, 60)) +
+  expand_limits(y = 0) +
+  coord_cartesian(ylim = c(0, NA)) +
+  labs(
+    title = paste0("EX_DYN - Cohort mean nRMS vs nTorque (N = ", length(run_ids), ")"),
+    subtitle = "Grey: mean of N=16 individual calibration fits (± SD).\nOpen circles: fresh reference at 30/50/70/100%.",
+    x = "nTorque (MVC_REF = 1)",
+    y = "nRMS (MVC_REF = 1)"
+  ) +
+  theme_amstrom_hgrid
+cohort_ex_dyn_rms_torque_mean_plot
+```
+
+#### 6.4.8.13 Cohort plot gallery
+
+```{r cohort_analysis_plot_gallery, eval=TRUE, fig.width=11, fig.height=7}
+# Render the selected cohort plots inline (gated by SHOW_COHORT_PLOTS).
+if (isTRUE(SHOW_COHORT_PLOTS)) {
+  print(cohort_rms_calibration_boxplot)
+  print(cohort_mdf_calibration_boxplot)
+  print(cohort_ex_dyn_ratio_plot_all)
+  print(cohort_ex_dyn_combined_fatigue_plot)
+  print(cohort_ex_dyn_rms_torque_cloud_plot)
+  print(cohort_ex_dyn_rms_torque_mean_plot)
+}
+```
+
+# 7. Summary
+
+## 7.1 Export report
+
+```{r summary_export_report}
+# Console note: run count + whether the cohort parquets were written this knit.
+message("Runs combined: ", length(run_ids))
+message("Cohort parquet export enabled: ", EXPORT_COHORT_PARQUET)
+if (isTRUE(EXPORT_COHORT_PARQUET)) {
+  message("Cohort outputs written to: ", normalizePath(cohort_output_root, winslash = "/", mustWork = FALSE))
+} else {
+  message("Cohort outputs were kept in memory only for this notebook run.")
+}
+```
+
+## 7.2 Summary tables
+
+Set `PRINT_SUMMARY_TABLES <- TRUE` in §6.4.1 controls to render these.
+
+### Reference calibration
+
+```{r summary_ref_calib, eval = PRINT_SUMMARY_TABLES}
+# Summary table: reference calibration (nRMS/nMDF by intensity level), VL only.
+cohort_reference_level_summary_table |>
+  dplyr::filter(channel == plot_channel) |>
+  dplyr::mutate(dplyr::across(c(mean_rms_norm, sd_rms_norm, mean_mdf_norm, sd_mdf_norm),
+                               ~round(.x, 3))) |>
+  dplyr::select(reference_level, n_runs, mean_rms_norm, sd_rms_norm, mean_mdf_norm, sd_mdf_norm) |>
+  knitr::kable(
+    col.names = c("Reference level", "N", "Mean nRMS", "SD nRMS", "Mean nMDF", "SD nMDF"),
+    caption   = paste0("Reference calibration - ", channel_display_labels[plot_channel],
+                       ". Values are normalised (1.0 = MVC level).")
+  )
+```
+
+### EX_DYN nRMS and nMDF (5 representative reps)
+
+```{r summary_ex_dyn, eval = PRINT_SUMMARY_TABLES}
+# Summary table: nRMS/nMDF at 5 evenly-spaced EX_DYN reps, VL.
+vl_dyn_rms <- cohort_ex_dyn_rms_mean_table |>
+  dplyr::filter(channel == plot_channel)
+
+idx_dyn <- round(seq(1, nrow(vl_dyn_rms), length.out = min(5L, nrow(vl_dyn_rms))))
+
+vl_dyn_rms[idx_dyn, ] |>
+  dplyr::left_join(
+    cohort_ex_dyn_mdf_mean_table |>
+      dplyr::filter(channel == plot_channel) |>
+      dplyr::select(VC_count, mean_mdf_norm, sd_mdf_norm),
+    by = "VC_count"
+  ) |>
+  dplyr::mutate(dplyr::across(c(mean_rms_norm, sd_rms_norm, mean_mdf_norm, sd_mdf_norm),
+                               ~round(.x, 3))) |>
+  dplyr::select(VC_count, n_runs, mean_rms_norm, sd_rms_norm, mean_mdf_norm, sd_mdf_norm) |>
+  knitr::kable(
+    col.names = c("Rep", "N", "Mean nRMS", "SD nRMS", "Mean nMDF", "SD nMDF"),
+    caption   = paste0("EX_DYN - 5 evenly-spaced reps - ", channel_display_labels[plot_channel],
+                       ". Normalised values (1.0 = MVC).")
+  )
+```
+
+
+### EMG-torque ratio slope per run
+
+```{r summary_ratio_slope, eval = PRINT_SUMMARY_TABLES}
+# Summary table: EMG/torque ratio slope per run (VL). Negative slope = ratio declining with fatigue.
+cohort_ratio_slope_summary_table |>
+  dplyr::filter(channel == plot_channel) |>
+  dplyr::mutate(dplyr::across(c(slope_estimate, intercept, r_squared), ~round(.x, 4))) |>
+  dplyr::select(RUN_ID, SEQ, slope_estimate, intercept, r_squared, n_points, fit_type) |>
+  dplyr::arrange(SEQ, RUN_ID) |>
+  knitr::kable(
+    col.names = c("Run", "SEQ", "Slope", "Intercept", "R2", "N", "Fit type"),
+    caption   = paste0("EMG-torque ratio slope per run - ", channel_display_labels[plot_channel],
+                       ". Negative slope = ratio declining with fatigue.")
+  )
+```
+
+# 8. Torque overview
+
+## 8.1 Assemble timeline tables
+
+```{r torque_overview_assemble}
+# Stitch every protocol sequence onto one shared x-axis for the full-session torque figure.
+# Each sequence keeps its own VC_count, then picks up a global_x offset so they lay end-to-end
+# + added the REST_GAP between them. Everything is in % MVC_REF so bars/holds are comparable across participants.
+REST_GAP <- 10L
+
+mvc_baseline_nm <- cohort_reference_level_feature_table_norm |>
+  dplyr::filter(channel == "emg10", SEQ == "MVC_REF") |>
+  dplyr::group_by(RUN_ID) |>
+  dplyr::summarise(mvc_nm = mean(torque_mean_Nm, na.rm = TRUE), .groups = "drop")
+
+raw_seqs <- c("WU", "MVC_REF", "SVC_REF", "EX_DYN", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+
+raw_tor <- lapply(run_ids, function(run_id) {
+  p <- file.path(export_root, run_id, "preprocessed_torque.parquet")
+  if (!file.exists(p)) return(NULL)
+  read_parquet(p) |>
+    dplyr::filter(SEQ %in% raw_seqs, VC == 1) |>
+    dplyr::group_by(SEQ, VC_count) |>
+    dplyr::summarise(mean_raw = mean(torque_raw, na.rm = TRUE), .groups = "drop") |>
+    dplyr::mutate(RUN_ID = run_id)
+}) |> dplyr::bind_rows()
+
+mvc_baseline_raw <- raw_tor |>
+  dplyr::filter(SEQ == "MVC_REF") |>
+  dplyr::group_by(RUN_ID) |>
+  dplyr::summarise(mvc_raw = mean(mean_raw, na.rm = TRUE), .groups = "drop")
+
+raw_tor_pct <- raw_tor |>
+  dplyr::left_join(mvc_baseline_raw, by = "RUN_ID") |>
+  dplyr::left_join(mvc_baseline_nm,  by = "RUN_ID") |>
+  dplyr::mutate(
+    pct_mvc   = mean_raw / mvc_raw * 100,
+    torque_nm = pct_mvc / 100 * mvc_nm
+  )
+
+ex_dyn_raw <- cohort_ex_dyn_mid1s_feature_table_norm |>
+  dplyr::filter(channel == "emg10") |>
+  dplyr::transmute(RUN_ID, VC_count, torque_nm = torque_mean_Nm,
+                   pct_mvc = torque_norm * 100, SEQ = "EX_DYN")
+
+ex_sta_raw <- cohort_ex_sta_mid1s_feature_table_norm |>
+  dplyr::filter(channel == "emg10") |>
+  dplyr::group_by(RUN_ID) |>
+  dplyr::arrange(window_id, .by_group = TRUE) |>
+  dplyr::mutate(VC_count = dplyr::row_number()) |>  # 1-based window index (EX_STA has no rep count)
+  dplyr::ungroup() |>
+  dplyr::transmute(RUN_ID, VC_count, torque_nm = torque_mean_Nm,
+                   pct_mvc = torque_norm * 100, SEQ = "EX_STA")
+
+summarise_seq <- function(df, val_col) {
+  return(df |>
+    dplyr::group_by(SEQ, VC_count) |>
+    dplyr::summarise(
+      n      = dplyr::n(),                            # runs at this rep/window
+      mean_v = mean(.data[[val_col]], na.rm = TRUE),  # cohort mean (% MVC)
+      sd_v   = sd(.data[[val_col]],   na.rm = TRUE),   # between-run SD
+      .groups = "drop"
+    ))
+}
+
+wu_sum      <- summarise_seq(raw_tor_pct |> dplyr::filter(SEQ == "WU"),            "pct_mvc")
+mvc_ref_sum <- summarise_seq(raw_tor_pct |> dplyr::filter(SEQ == "MVC_REF"),       "pct_mvc")
+svc_ref_sum <- summarise_seq(raw_tor_pct |> dplyr::filter(SEQ == "SVC_REF"),       "pct_mvc")
+recov_dyn_s <- summarise_seq(raw_tor_pct |> dplyr::filter(SEQ == "MVC_RECOV_DYN"), "pct_mvc")
+recov_sta_s <- summarise_seq(raw_tor_pct |> dplyr::filter(SEQ == "MVC_RECOV_STA"), "pct_mvc")
+dyn_sum     <- summarise_seq(ex_dyn_raw, "pct_mvc")
+sta_sum     <- summarise_seq(ex_sta_raw, "pct_mvc")
+
+wu_max      <- max(wu_sum$VC_count)         # block lengths -> used to offset the next sequence
+mvc_ref_max <- max(mvc_ref_sum$VC_count)
+svc_ref_max <- max(svc_ref_sum$VC_count)
+dyn_max     <- max(dyn_sum$VC_count)
+sta_max     <- max(sta_sum$VC_count)
+
+# Global x offsets (sequences are -> WU | REST0 | MVC_REF | REST1 | SVC_REF | REST2 |
+# EX_DYN | REST3 | MVC_RECOV_DYN | REST4 | EX_STA | REST5 | MVC_RECOV_STA
+offsets <- list(
+  WU            = 0L,
+  REST0         = wu_max,
+  MVC_REF       = wu_max + REST_GAP,
+  REST1         = wu_max + REST_GAP + mvc_ref_max,
+  SVC_REF       = wu_max + REST_GAP * 2 + mvc_ref_max,
+  REST2         = wu_max + REST_GAP * 2 + mvc_ref_max + svc_ref_max,
+  EX_DYN        = wu_max + REST_GAP * 3 + mvc_ref_max + svc_ref_max,
+  REST3         = wu_max + REST_GAP * 3 + mvc_ref_max + svc_ref_max + dyn_max,
+  MVC_RECOV_DYN = wu_max + REST_GAP * 4 + mvc_ref_max + svc_ref_max + dyn_max,
+  REST4         = wu_max + REST_GAP * 4 + mvc_ref_max + svc_ref_max + dyn_max + 1L,  # +1L nudge so EX_STA clears recovery
+  EX_STA        = wu_max + REST_GAP * 5 + mvc_ref_max + svc_ref_max + dyn_max + 1L,
+  REST5         = wu_max + REST_GAP * 5 + mvc_ref_max + svc_ref_max + dyn_max + 1L + sta_max,
+  MVC_RECOV_STA = wu_max + REST_GAP * 6 + mvc_ref_max + svc_ref_max + dyn_max + 1L + sta_max
+)
+
+assign_x <- function(df, offset) return(dplyr::mutate(df, global_x = VC_count + offset))  # place a sequence on the shared axis
+
+timeline <- dplyr::bind_rows(
+  assign_x(wu_sum,      offsets$WU),
+  assign_x(mvc_ref_sum, offsets$MVC_REF),
+  assign_x(svc_ref_sum, offsets$SVC_REF),
+  assign_x(dyn_sum,     offsets$EX_DYN),
+  assign_x(recov_dyn_s, offsets$MVC_RECOV_DYN),
+  assign_x(sta_sum,     offsets$EX_STA),
+  assign_x(recov_sta_s, offsets$MVC_RECOV_STA)
+)
+
+vlines <- data.frame(
+  x     = c(offsets$REST0, offsets$REST1, offsets$REST2,
+            offsets$REST3, offsets$REST4, offsets$REST5),
+  label = c("REST0\n~3 min", "REST1\n~3 min", "REST2\n~3 min",
+            "REST3\n~5 min", "REST4\n~5 min", "REST5\n~5 min")
+)
+
+seq_labels <- data.frame(
+  x = c(
+    offsets$WU + wu_max / 2,
+    offsets$MVC_REF + mvc_ref_max / 2,
+    offsets$SVC_REF + svc_ref_max / 2,
+    offsets$EX_DYN + dyn_max / 2,
+    offsets$MVC_RECOV_DYN,
+    offsets$EX_STA + sta_max / 2,
+    offsets$MVC_RECOV_STA
+  ),
+  label = c("WU", "MVC_REF", "SVC_REF", "EX_DYN",
+            "MVC_RECOV\nDYN", "EX_STA", "MVC_RECOV\nSTA"),
+  y = -8
+)
+
+eb_positions <- timeline |>
+  dplyr::filter(
+    (SEQ == "WU"      & VC_count %in% c(1, 6, 12)) |
+    SEQ == "MVC_REF"  |
+    SEQ == "SVC_REF"  |
+    (SEQ == "EX_DYN"  & VC_count %in% c(1, 10, 20, 30, 40, 50, 60)) |
+    SEQ == "MVC_RECOV_DYN" |
+    (SEQ == "EX_STA"  & VC_count %in% c(1, 12, 24, 36, 48)) |
+    SEQ == "MVC_RECOV_STA"
+  )
+```
+
+## 8.2 Plot 1 — full-session timeline
+
+```{r torque_overview_full_timeline_plot, fig.width = 12, fig.height = 5}
+# Plot : full-session torque profile. Discrete contractions as bars, EX_STA as a line, error
+# bars = +/-1 SD between participants, reference lines at 70% and 100% MVC.
+timeline_bins <- timeline |> dplyr::filter(SEQ != "EX_STA")
+timeline_sta  <- timeline |> dplyr::filter(SEQ == "EX_STA")
+
+eb_bins <- eb_positions |> dplyr::filter(SEQ != "EX_STA")
+eb_sta  <- eb_positions |> dplyr::filter(SEQ == "EX_STA")
+
+torque_timeline_full_plot <- ggplot() +
+  geom_hline(yintercept = 100, linetype = "dashed", colour = "grey55", linewidth = 0.4) +
+  annotate("text", x = 1, y = 101.5, label = "100% MVC ref",
+           size = 2.4, colour = "grey50", hjust = 0) +
+  geom_text(data = vlines, aes(x = x + REST_GAP / 2, label = label),
+            y = 107, size = 2.5, colour = "grey55", vjust = 1, lineheight = 0.85,
+            inherit.aes = FALSE) +
+  geom_col(data = timeline_bins, aes(x = global_x, y = mean_v),
+           fill = col_torque, colour = NA, width = 0.75) +
+  geom_line(data = timeline_sta, aes(x = global_x, y = mean_v),
+            colour = col_torque, linewidth = 0.8) +
+  geom_errorbar(data = eb_bins,
+                aes(x = global_x, ymin = mean_v - sd_v, ymax = mean_v + sd_v),
+                colour = "grey20", width = 0.55, linewidth = 0.45) +
+  geom_errorbar(data = eb_sta,
+                aes(x = global_x, ymin = mean_v - sd_v, ymax = mean_v + sd_v),
+                colour = col_torque, width = 1.2, linewidth = 0.45) +
+  geom_point(data = eb_sta, aes(x = global_x, y = mean_v),
+             colour = col_torque, shape = 21, fill = "white", size = 1.8) +
+  geom_hline(yintercept = 70, linetype = "dotted", colour = "grey55", linewidth = 0.4) +
+  geom_text(data = seq_labels, aes(x = x, y = y, label = label),
+            size = 2.6, colour = "grey30", vjust = 1, lineheight = 0.85,
+            inherit.aes = FALSE) +
+  scale_x_continuous(breaks = NULL) +
+  scale_y_continuous(breaks = c(0, 25, 50, 75, 100),
+                     labels = function(x) paste0(x, "%")) +
+  coord_cartesian(ylim = c(-14, 112)) +
+  labs(
+    title    = paste0("Full-session torque profile - N = ", length(run_ids)),
+    subtitle = "Bins = discrete contractions; line = sustained hold (EX_STA); error bars = +/-1 SD between participants",
+    x = NULL, y = "Torque (% MVC_REF)"
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.ticks.x = element_blank())
+
+torque_timeline_full_plot
+```
+
+## 8.3 Plot 2 — EX_DYN zoom
+
+```{r torque_overview_ex_dyn_zoom_plot, fig.width = 10, fig.height = 5}
+# Plot: zoom on the EX_DYN torque decline over 60 reps, % labels at selected reps.
+dyn_eb <- dyn_sum |> dplyr::filter(VC_count %in% c(1, 10, 20, 30, 40, 50, 60))
+
+torque_timeline_ex_dyn_zoom_plot <- ggplot(dyn_sum, aes(x = VC_count, y = mean_v)) +
+  geom_hline(yintercept = 100, linetype = "dashed", colour = "grey55", linewidth = 0.4) +
+  geom_col(fill = col_torque, colour = NA, width = 0.75) +
+  geom_errorbar(data = dyn_eb,
+                aes(ymin = mean_v - sd_v, ymax = mean_v + sd_v),
+                colour = "grey20", width = 1.0, linewidth = 0.45) +
+  geom_text(data = dyn_eb,
+            aes(label = paste0(round(mean_v, 0), "%")),
+            vjust = -0.4, nudge_y = dyn_eb$sd_v + 1,
+            size = 2.8, colour = col_torque) +
+  scale_x_continuous(breaks = c(1, 10, 20, 30, 40, 50, 60)) +
+  scale_y_continuous(breaks = seq(0, 100, 25),
+                     labels = function(x) paste0(x, "%")) +
+  expand_limits(y = 0) +
+  coord_cartesian(ylim = c(0, 120)) +
+  labs(
+    title    = paste0("EX_DYN - Torque decline over 60 reps (N = ", length(run_ids), ")"),
+    subtitle = "Repeated maximal isometric contractions - Mean +/-1 SD between participants at selected reps",
+    x = "Repetition", y = "Torque (% MVC_REF)"
+  ) +
+  theme_amstrom_hgrid
+
+torque_timeline_ex_dyn_zoom_plot
+```
+
+## 8.4 Plot 3 — EX_STA zoom
+
+```{r torque_overview_ex_sta_zoom_plot, fig.width = 10, fig.height = 5}
+# Plot: zoom on the EX_STA hold, with the 70% target and 60% lower-bound reference lines.
+# EDIT WHEN SWITCHING TO A VERSION W/O LOWER BOUND !!
+sta_eb <- sta_sum |> dplyr::filter(VC_count %in% c(1, 12, 24, 36, 48))
+
+torque_timeline_ex_sta_zoom_plot <- ggplot(sta_sum, aes(x = VC_count, y = mean_v)) +
+  geom_hline(yintercept = 70, linetype = "dashed", colour = "grey60", linewidth = 0.5) +
+  annotate("text", x = 1, y = 71.5, label = "70% MVC target",
+           size = 2.8, colour = "grey50", hjust = 0) +
+  geom_hline(yintercept = 60, linetype = "dashed", colour = "grey60", linewidth = 0.5) +
+  annotate("text", x = 1, y = 61.5, label = "60% lower bound",
+           size = 2.8, colour = "grey50", hjust = 0) +
+  geom_line(colour = col_torque, linewidth = 0.8) +
+  geom_errorbar(data = sta_eb,
+                aes(ymin = mean_v - sd_v, ymax = mean_v + sd_v),
+                colour = col_torque, width = 1.2, linewidth = 0.5) +
+  geom_point(data = sta_eb, colour = col_torque,
+             shape = 21, fill = "white", size = 2.5) +
+  geom_text(data = sta_eb,
+            aes(label = paste0(round(mean_v, 0), "%")),
+            vjust = -1.2, size = 2.8, colour = col_torque) +
+  scale_x_continuous(breaks = c(1, 12, 24, 36, 48)) +
+  scale_y_continuous(breaks = seq(0, 100, 10),
+                     labels = function(x) paste0(x, "%")) +
+  expand_limits(y = 0) +
+  coord_cartesian(ylim = c(0, 90)) +
+  labs(
+    title    = paste0("EX_STA - Torque during sustained isometric hold (N = ", length(run_ids), ")"),
+    subtitle = "Target: 70% MVC - Mean +/-1 SD between participants",
+    x = "Window index", y = "Torque (% MVC_REF)"
+  ) +
+  theme_amstrom_hgrid
+
+torque_timeline_ex_sta_zoom_plot
+```
+
+## 8.5 Nm summary table
+
+```{r torque_overview_nm_summary_table}
+# Summary table: torque per sequence in both % MVC_REF and absolute Nm (mean +/- SD).
+# nm_summary_helper collapses one sequence to mean/SD per rep/window; `picks` selects rows to show.
+nm_summary_helper <- function(df, picks = NULL) {
+  out <- df |>
+    dplyr::group_by(SEQ, VC_count) |>
+    dplyr::summarise(mean_nm  = mean(torque_nm, na.rm = TRUE),
+                     sd_nm    = sd(torque_nm,   na.rm = TRUE),
+                     mean_pct = mean(pct_mvc,   na.rm = TRUE),
+                     sd_pct   = sd(pct_mvc,     na.rm = TRUE),
+                     .groups  = "drop")
+  if (!is.null(picks)) out <- dplyr::filter(out, VC_count %in% picks)
+  return(out)
+}
+
+nm_summary <- dplyr::bind_rows(
+  nm_summary_helper(raw_tor_pct |> dplyr::filter(SEQ == "MVC_REF")),
+  nm_summary_helper(raw_tor_pct |> dplyr::filter(SEQ == "SVC_REF")),
+  nm_summary_helper(raw_tor_pct |> dplyr::filter(SEQ == "EX_DYN"),
+                   picks = c(1, 10, 20, 30, 40, 50, 60)),
+  nm_summary_helper(raw_tor_pct |> dplyr::filter(SEQ == "MVC_RECOV_DYN")),
+  nm_summary_helper(ex_sta_raw, picks = c(1, 7, 14, 20, 27)),
+  nm_summary_helper(raw_tor_pct |> dplyr::filter(SEQ == "MVC_RECOV_STA"))
+)
+
+nm_summary |>
+  dplyr::mutate(
+    mean_sd_pct = sprintf("%.1f +/- %.1f", mean_pct, sd_pct),
+    mean_sd_nm  = sprintf("%.1f +/- %.1f", mean_nm,  sd_nm)
+  ) |>
+  dplyr::select(SEQ, VC_count, mean_sd_pct, mean_sd_nm) |>
+  knitr::kable(
+    col.names = c("Sequence", "Rep / Win", "Mean +/- SD (%MVC)", "Mean +/- SD (Nm)"),
+    caption   = paste0("Torque summary - N = ", length(run_ids))
+  )
+```
+
+
+
+## 8.7 Export PDFs (optional)
+
+```{r torque_overview_export_pdf_sec87}
+# Optionally write the timeline + zoom plots to results/QC_EXPORT/ (gated by the §5.1 flag).
+if (isTRUE(EXPORT_TORQUE_TIMELINE_PDF)) {
+  out_pdf <- here::here("results", "QC_EXPORT", "torque_timeline.pdf")
+  dir.create(dirname(out_pdf), showWarnings = FALSE, recursive = TRUE)
+
+  pdf(out_pdf, width = 12, height = 5)
+  print(torque_timeline_full_plot)
+  dev.off()
+
+  pdf(sub("\\.pdf$", "_zoom.pdf", out_pdf), width = 10, height = 5)
+  print(torque_timeline_ex_dyn_zoom_plot)
+  print(torque_timeline_ex_sta_zoom_plot)
+  dev.off()
+
+  message("Saved: ", out_pdf)
+  message("Saved: ", sub("\\.pdf$", "_zoom.pdf", out_pdf))
+}
+```

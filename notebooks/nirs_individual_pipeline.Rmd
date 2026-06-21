@@ -1,0 +1,809 @@
+---
+title: "Individual NIRS Analysis Pipeline"
+author: "Morgan Virolan"
+date: "2026-05-16"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+
+params:
+  RUN_ID: "209CeJa_20251105"
+---
+
+# Overview
+
+Single-run NIRS analysis: load ΔHHb, compute sequence baselines/features, build EX_DYN/EX_STA summaries, and write cohort-ready tables.
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(glue)
+options(dplyr.summarise.inform = FALSE)
+source(here::here("sources", "R", "config", "amstrom_style.R"))
+```
+
+```{r controls}
+RUN_ID <- params$RUN_ID
+
+PIPELINE_MODE          <- "full_run"
+SHOW_NIRS_PLOTS        <- identical(PIPELINE_MODE, "full_run")
+EXPORT_NIRS_PLOTS      <- identical(PIPELINE_MODE, "full_run")
+EXPORT_ANALYSIS_TABLES <- identical(PIPELINE_MODE, "full_run")
+
+NIRS_SIGNAL_COL <- "nirs_hhb_tx1"   # ΔHHb, Tx1 = 35 mm source-detector distance
+NIRS_FS_HZ      <- 10.0             # nominal sampling rate (Oxysoft export)
+
+# Optional low-pass Butterworth filter on the full continuous signal.
+# Off by default: per-window averaging already acts as an implicit low-pass filter,
+# and isometric contractions on a fixed dynamometer produce minimal motion artifact.
+APPLY_NIRS_FILTER  <- FALSE
+NIRS_FILTER_CUTOFF <- 0.3           # Hz (1st-order Butterworth LP if enabled)
+
+# EX_STA windowing (parallel to BIA pipeline)
+EX_STA_WINDOW_LENGTH_S      <- 1.0
+EX_STA_WINDOW_STEP_S        <- 1.0
+
+# EX_DYN onset slope: first N samples per contraction (1 s at 10 Hz)
+EXDYN_SLOPE_SAMPLES <- 10L
+
+# Pre-exercise baseline window relative to first VC==1 onset in each sequence
+BASELINE_START_S <- -10.0
+BASELINE_END_S   <- -5.0
+
+critical_seqs <- c("MVC_REF", "SVC_REF", "EX_DYN", "EX_STA", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+```
+
+# 2. Load exported data
+
+```{r load_data}
+export_root   <- here::here("results", "DATA_EXPORT")
+run_directory <- file.path(export_root, RUN_ID)
+
+master_table <- arrow::read_parquet(
+  file.path(run_directory, "master_index_grid.parquet"),
+  col_select = c("time_index", "time_ref_s", "SEQ_index", "SEQ", "VC", "VC_count")
+)
+
+# Join time_ref_s from the master grid — preprocessed_nirs.parquet carries time_index
+# and SEQ/VC/VC_count labels but not the master reference time axis.
+nirs_raw <- arrow::read_parquet(
+  file.path(run_directory, "preprocessed_nirs.parquet")
+) |>
+  dplyr::left_join(
+    dplyr::select(master_table, time_index, time_ref_s),
+    by = "time_index"
+  ) |>
+  dplyr::arrange(.data$time_ref_s)
+
+participant_table <- arrow::read_parquet(
+  file.path(run_directory, "participant.parquet")
+) |>
+  dplyr::mutate(RUN_ID = .env$RUN_ID, .before = 1)
+
+participant_id <- participant_table$participant_id[[1]]
+
+cat("RUN_ID:", RUN_ID, "\n")
+cat("participant_id:", participant_id, "\n")
+cat("nrow(master_table):", nrow(master_table), "\n")
+cat("nrow(nirs_raw):    ", nrow(nirs_raw), "\n")
+cat("signal column:     ", NIRS_SIGNAL_COL, "\n")
+```
+
+# 3. Sequence validity gate
+
+```{r check_nirs_sequence_validity}
+# Validity gate: every critical sequence must have VC==1 samples, else stop.
+seqs_with_contractions <- nirs_raw |>
+  dplyr::filter(.data$VC == 1L) |>
+  dplyr::distinct(.data$SEQ) |>
+  dplyr::pull(.data$SEQ)
+
+missing_critical <- setdiff(critical_seqs, seqs_with_contractions)
+
+if (length(missing_critical) > 0L) {
+  stop(glue(
+    "NIRS validity check FAILED for {RUN_ID}: ",
+    "no VC==1 samples found in critical sequence(s): ",
+    paste(missing_critical, collapse = ", ")
+  ))
+}
+
+cat("NIRS sequence validity OK — all critical sequences have VC==1 samples.\n")
+cat("Sequences with contractions:", paste(sort(seqs_with_contractions), collapse = ", "), "\n")
+```
+
+# 4. (Optional) Low-pass filter
+
+```{r apply_nirs_filter}
+if (isTRUE(APPLY_NIRS_FILTER)) {
+  library(signal)
+  bf       <- signal::butter(1L, NIRS_FILTER_CUTOFF / (NIRS_FS_HZ / 2), type = "low")
+  raw_vals <- nirs_raw[[NIRS_SIGNAL_COL]]
+
+  # Interpolate internal NAs before filtering to prevent them from propagating.
+  if (any(is.na(raw_vals))) {
+    idx       <- seq_along(raw_vals)
+    good      <- is.finite(raw_vals)
+    raw_vals  <- approx(idx[good], raw_vals[good], xout = idx, rule = 2L)$y
+  }
+
+  nirs_raw[[NIRS_SIGNAL_COL]] <- as.numeric(signal::filtfilt(bf, raw_vals))
+  cat(glue("LP filter applied: 1st-order Butterworth at {NIRS_FILTER_CUTOFF} Hz.\n"))
+} else {
+  cat("No filter applied (APPLY_NIRS_FILTER = FALSE).\n")
+}
+```
+
+# 5. Baseline computation
+
+```{r compute_nirs_baseline}
+# Pre-exercise baseline: mean ΔHHb in [onset - 10 s, onset - 5 s) for each sequence.
+# The 5 s gap before onset avoids anticipatory contraction artefacts.
+# Baseline is stored for subtraction in each feature table (hhb_from_baseline_umol).
+
+compute_seq_baseline <- function(nirs_df, seq_name) {
+  onset_s <- nirs_df |>
+    dplyr::filter(.data$SEQ == seq_name, .data$VC == 1L) |>
+    dplyr::summarise(onset = min(.data$time_ref_s, na.rm = TRUE)) |>
+    dplyr::pull(.data$onset)
+
+  if (length(onset_s) == 0L || !is.finite(onset_s)) {
+    return(tibble::tibble(
+      SEQ = seq_name, hhb_baseline_umol = NA_real_,
+      o2hb_baseline_umol = NA_real_, thb_baseline_umol = NA_real_,
+      n_baseline_samples = 0L
+    ))
+  }
+
+  return(nirs_df |>
+    dplyr::filter(
+      .data$time_ref_s >= onset_s + BASELINE_START_S,
+      .data$time_ref_s <  onset_s + BASELINE_END_S
+    ) |>
+    dplyr::summarise(
+      SEQ                = seq_name,
+      hhb_baseline_umol  = mean(.data[[NIRS_SIGNAL_COL]], na.rm = TRUE),  # resting ΔHHb
+      o2hb_baseline_umol = mean(.data$nirs_o2hb_tx1, na.rm = TRUE),       # resting O2Hb
+      thb_baseline_umol  = mean(.data$nirs_thb_tx1, na.rm = TRUE),        # resting tHb
+      n_baseline_samples = sum(is.finite(.data[[NIRS_SIGNAL_COL]]))       # samples in the rest window
+    ))
+}
+
+nirs_baseline_table <- dplyr::bind_rows(
+  lapply(critical_seqs, compute_seq_baseline, nirs_df = nirs_raw)
+)
+
+# Fresh (global) baseline: mean ΔHHb in [MVC_REF onset − 10s, onset − 5s).
+# This is before any voluntary contraction — the cleanest resting state in the session.
+# Used for hhb_from_baseline_umol in all feature tables (preserves carry-over across sequences).
+fresh_baseline_umol <- nirs_baseline_table |>
+  dplyr::filter(.data$SEQ == "MVC_REF") |>
+  dplyr::pull(.data$hhb_baseline_umol)
+
+print(nirs_baseline_table)
+cat("Fresh baseline (before MVC_REF):", round(fresh_baseline_umol, 4), "umol/L\n")
+```
+
+# 6. Reference and checkpoint table
+
+```{r build_reference_feature_table}
+# Per-VC mean ΔHHb for MVC_REF, SVC_REF (3 intensity levels), and recovery sequences.
+
+ref_seqs <- c("MVC_REF", "SVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+
+nirs_reference_feature_table <- nirs_raw |>
+  dplyr::filter(.data$SEQ %in% ref_seqs, .data$VC == 1L) |>
+  dplyr::group_by(.data$SEQ, .data$VC_count) |>
+  # Coherence with EMG/torque feature window: keep only the middle 1 s of each
+  # contraction. See `extract_middle_1s_window` in emg_individual_pipeline.Rmd.
+  dplyr::mutate(
+    t_mid     = (min(.data$time_ref_s) + max(.data$time_ref_s)) / 2,
+    mid_start = t_mid - 0.5,
+    mid_end   = t_mid + 0.5
+  ) |>
+  dplyr::filter(.data$time_ref_s >= mid_start, .data$time_ref_s < mid_end) |>
+  dplyr::summarise(
+    mean_hhb_umol  = mean(.data[[NIRS_SIGNAL_COL]], na.rm = TRUE),  # mean ΔHHb over the mid-1s window
+    mean_o2hb_umol = mean(.data$nirs_o2hb_tx1, na.rm = TRUE),       # mean O2Hb
+    mean_thb_umol  = mean(.data$nirs_thb_tx1, na.rm = TRUE),        # mean tHb
+    time_mid_s     = mean(.data$time_ref_s, na.rm = TRUE),          # window midpoint time
+    n_samples      = sum(is.finite(.data[[NIRS_SIGNAL_COL]])),      # samples in the window
+    .groups        = "drop"
+  ) |>
+  dplyr::left_join(nirs_baseline_table, by = "SEQ") |>
+  dplyr::mutate(
+    RUN_ID          = .env$RUN_ID,
+    participant_id  = .env$participant_id,
+    source_sequence = .data$SEQ,
+    reference_level = dplyr::case_when(
+      .data$SEQ == "SVC_REF" & .data$VC_count == 1L ~ "30%",
+      .data$SEQ == "SVC_REF" & .data$VC_count == 2L ~ "50%",
+      .data$SEQ == "SVC_REF" & .data$VC_count == 3L ~ "70%",
+      .data$SEQ == "MVC_REF"                         ~ "100%",
+      TRUE                                            ~ NA_character_
+    ),
+    state_label = dplyr::case_when(
+      .data$SEQ == "SVC_REF" ~ paste0("SVC_", .data$reference_level),
+      TRUE                   ~ .data$SEQ
+    ),
+    hhb_from_baseline_umol  = .data$mean_hhb_umol - .env$fresh_baseline_umol,
+    hhb_from_seq_rest_umol  = .data$mean_hhb_umol - .data$hhb_baseline_umol,
+    o2hb_from_seq_rest_umol = .data$mean_o2hb_umol - .data$o2hb_baseline_umol,
+    thb_from_seq_rest_umol  = .data$mean_thb_umol - .data$thb_baseline_umol,
+    evidence_status = "provisional",
+    .before = 1
+  ) |>
+  dplyr::select(
+    RUN_ID, participant_id,
+    source_sequence, state_label, reference_level,
+    VC_count,
+    mean_hhb_umol, hhb_from_baseline_umol, hhb_from_seq_rest_umol,
+    mean_o2hb_umol, o2hb_from_seq_rest_umol,
+    mean_thb_umol, thb_from_seq_rest_umol,
+    hhb_baseline_umol, n_baseline_samples,
+    time_mid_s, n_samples, evidence_status
+  ) |>
+  dplyr::arrange(.data$source_sequence, .data$VC_count)
+```
+
+# 7. EX_DYN feature table
+
+```{r build_ex_dyn_feature_table}
+# EX_DYN at 10 Hz: ~30 samples per contraction (3 s ON), ~20 samples per rest (2 s OFF).
+#
+# VC_count is 0 for all rest periods — cummax(VC_count) on time-sorted rows fills in
+# the preceding contraction index, enabling rest-period features to be linked to their
+# contraction.
+
+ex_dyn_rows <- nirs_raw |>
+  dplyr::filter(.data$SEQ == "EX_DYN") |>
+  dplyr::arrange(.data$time_ref_s) |>
+  dplyr::mutate(preceding_vc = cummax(.data$VC_count))
+
+ex_dyn_baseline_umol <- nirs_baseline_table |>
+  dplyr::filter(.data$SEQ == "EX_DYN") |>
+  dplyr::pull(.data$hhb_baseline_umol)
+
+ex_dyn_o2hb_baseline_umol <- nirs_baseline_table |>
+  dplyr::filter(.data$SEQ == "EX_DYN") |>
+  dplyr::pull(.data$o2hb_baseline_umol)
+
+ex_dyn_thb_baseline_umol <- nirs_baseline_table |>
+  dplyr::filter(.data$SEQ == "EX_DYN") |>
+  dplyr::pull(.data$thb_baseline_umol)
+
+# --- Contraction features (VC==1): mean, desat amplitude, onset slope ---
+# `mean_hhb_umol` uses the middle 1 s of each contraction (coherence with the
+# EMG/torque feature window, see `extract_middle_1s_window` in
+# emg_individual_pipeline.Rmd). `hhb_desat_umol` and `hhb_slope_umol_s` keep the
+# full VC==1 window: desat needs the full range (max-min) to be meaningful,
+# slope is by definition computed over the onset samples.
+ex_dyn_contraction_full <- ex_dyn_rows |>
+  dplyr::filter(.data$VC == 1L) |>
+  dplyr::group_by(.data$VC_count) |>
+  dplyr::summarise(
+    hhb_desat_umol = max(.data[[NIRS_SIGNAL_COL]], na.rm = TRUE) -
+                     min(.data[[NIRS_SIGNAL_COL]], na.rm = TRUE),
+    hhb_slope_umol_s = {
+      # Slope of ΔHHb in the first EXDYN_SLOPE_SAMPLES (1 s) of each contraction.
+      # Rows are time-sorted, so head() gives the onset samples.
+      sig_v <- head(.data[[NIRS_SIGNAL_COL]], .env$EXDYN_SLOPE_SAMPLES)
+      t_v   <- head(.data$time_ref_s, .env$EXDYN_SLOPE_SAMPLES)
+      ok    <- is.finite(sig_v) & is.finite(t_v)
+      if (sum(ok) >= 3L) {
+        unname(coef(lm(sig_v[ok] ~ t_v[ok]))[[2]])
+      } else {
+        NA_real_
+      }
+    },
+    time_mid_s     = mean(.data$time_ref_s, na.rm = TRUE),
+    n_samples_cont = sum(is.finite(.data[[NIRS_SIGNAL_COL]])),
+    .groups        = "drop"
+  )
+
+ex_dyn_contraction_mid1s <- ex_dyn_rows |>
+  dplyr::filter(.data$VC == 1L) |>
+  dplyr::group_by(.data$VC_count) |>
+  dplyr::mutate(
+    t_mid     = (min(.data$time_ref_s) + max(.data$time_ref_s)) / 2,
+    mid_start = t_mid - 0.5,
+    mid_end   = t_mid + 0.5
+  ) |>
+  dplyr::filter(.data$time_ref_s >= mid_start, .data$time_ref_s < mid_end) |>
+  dplyr::summarise(
+    mean_hhb_umol  = mean(.data[[NIRS_SIGNAL_COL]], na.rm = TRUE),
+    mean_o2hb_umol = mean(.data$nirs_o2hb_tx1, na.rm = TRUE),
+    mean_thb_umol  = mean(.data$nirs_thb_tx1, na.rm = TRUE),
+    .groups        = "drop"
+  )
+
+ex_dyn_contraction <- ex_dyn_contraction_full |>
+  dplyr::left_join(ex_dyn_contraction_mid1s, by = "VC_count") |>
+  dplyr::select(
+    VC_count, mean_hhb_umol, mean_o2hb_umol, mean_thb_umol,
+    hhb_desat_umol, hhb_slope_umol_s,
+    time_mid_s, n_samples_cont
+  )
+
+# --- Rest features (VC==0): reoxygenation amplitude ---
+# hhb_sat = first(ΔHHb at rest onset) - min(ΔHHb during rest).
+# HHb peaks near the end of contraction then falls during rest as O2 is resupplied;
+# the amplitude of that fall is the reoxy metric.
+ex_dyn_rest <- ex_dyn_rows |>
+  dplyr::filter(.data$VC == 0L, .data$preceding_vc > 0L) |>
+  dplyr::group_by(.data$preceding_vc) |>
+  dplyr::summarise(
+    hhb_sat_umol   = dplyr::first(.data[[NIRS_SIGNAL_COL]]) -
+                     min(.data[[NIRS_SIGNAL_COL]], na.rm = TRUE),
+    n_samples_rest = sum(is.finite(.data[[NIRS_SIGNAL_COL]])),
+    .groups        = "drop"
+  ) |>
+  dplyr::rename(VC_count = preceding_vc)
+
+nirs_ex_dyn_feature_table <- ex_dyn_contraction |>
+  dplyr::left_join(ex_dyn_rest, by = "VC_count") |>
+  dplyr::mutate(
+    RUN_ID                  = .env$RUN_ID,
+    participant_id          = .env$participant_id,
+    source_sequence         = "EX_DYN",
+    hhb_from_baseline_umol  = .data$mean_hhb_umol - .env$fresh_baseline_umol,
+    hhb_from_seq_rest_umol  = .data$mean_hhb_umol - .env$ex_dyn_baseline_umol,
+    o2hb_from_seq_rest_umol = .data$mean_o2hb_umol - .env$ex_dyn_o2hb_baseline_umol,
+    thb_from_seq_rest_umol  = .data$mean_thb_umol - .env$ex_dyn_thb_baseline_umol,
+    evidence_status         = "provisional",
+    .before                 = 1
+  ) |>
+  dplyr::select(
+    RUN_ID, participant_id, source_sequence,
+    VC_count,
+    mean_hhb_umol, hhb_from_baseline_umol, hhb_from_seq_rest_umol,
+    mean_o2hb_umol, o2hb_from_seq_rest_umol,
+    mean_thb_umol, thb_from_seq_rest_umol,
+    hhb_desat_umol, hhb_slope_umol_s, hhb_sat_umol,
+    time_mid_s, n_samples_cont, n_samples_rest,
+    evidence_status
+  ) |>
+  dplyr::filter(.data$VC_count <= 60L) |>
+  dplyr::arrange(.data$VC_count)
+```
+
+# 8. EX_STA feature table
+
+```{r build_ex_sta_window_table}
+# 1 s non-overlapping windows over the continuous EX_STA VC==1 signal.
+# Onset is determined by torque threshold (parallel to BIA pipeline).
+
+ex_sta_samples <- nirs_raw |>
+  dplyr::filter(.data$SEQ == "EX_STA", .data$VC == 1L) |>
+  dplyr::arrange(.data$time_ref_s)
+
+if (nrow(ex_sta_samples) == 0L) {
+  stop(glue("EX_STA contains no VC==1 NIRS samples for {RUN_ID}."))
+}
+
+t_sta_start    <- min(ex_sta_samples$time_ref_s)
+t_sta_end      <- max(ex_sta_samples$time_ref_s)
+window_start_s <- seq(t_sta_start, t_sta_end - EX_STA_WINDOW_LENGTH_S, by = EX_STA_WINDOW_STEP_S)
+
+ex_sta_window_layout <- tibble::tibble(
+  window_id      = seq_along(window_start_s),
+  window_start_s = window_start_s,
+  window_end_s   = window_start_s + EX_STA_WINDOW_LENGTH_S,
+  window_mid_s   = window_start_s + EX_STA_WINDOW_LENGTH_S / 2
+)
+
+ex_sta_window_raw <- ex_sta_samples |>
+  dplyr::mutate(
+    window_id = floor((.data$time_ref_s - t_sta_start) / EX_STA_WINDOW_STEP_S) + 1L
+  ) |>
+  dplyr::filter(.data$window_id >= 1L, .data$window_id <= nrow(ex_sta_window_layout)) |>
+  dplyr::left_join(ex_sta_window_layout, by = "window_id") |>
+  dplyr::group_by(.data$window_id, .data$window_mid_s) |>
+  dplyr::summarise(
+    mean_hhb_umol  = mean(.data[[NIRS_SIGNAL_COL]], na.rm = TRUE),  # mean ΔHHb in this 1s window
+    mean_o2hb_umol = mean(.data$nirs_o2hb_tx1, na.rm = TRUE),       # mean O2Hb
+    mean_thb_umol  = mean(.data$nirs_thb_tx1, na.rm = TRUE),        # mean tHb
+    n_samples      = sum(is.finite(.data[[NIRS_SIGNAL_COL]])),      # samples in this window
+    .groups        = "drop"
+  ) |>
+  dplyr::arrange(.data$window_id)
+```
+
+```{r filter_ex_sta_onset_windows}
+# Common onset keeps the EX_STA denominator aligned with EMG and BIA exports.
+EX_STA_COMMON_ONSET_WINDOW_ID <- 2L
+
+ex_sta_onset_window_id <- EX_STA_COMMON_ONSET_WINDOW_ID
+ex_sta_onset_mid_s     <- ex_sta_window_layout$window_mid_s[[ex_sta_onset_window_id]]
+
+window_index_lookup <- ex_sta_window_layout |>
+  dplyr::filter(.data$window_id >= ex_sta_onset_window_id) |>
+  dplyr::mutate(
+    window_index             = dplyr::row_number(),
+    window_time_from_start_s = .data$window_mid_s - ex_sta_onset_mid_s
+  ) |>
+  dplyr::select(window_id, window_index, window_time_from_start_s)
+
+ex_sta_baseline_umol <- nirs_baseline_table |>
+  dplyr::filter(.data$SEQ == "EX_STA") |>
+  dplyr::pull(.data$hhb_baseline_umol)
+
+ex_sta_o2hb_baseline_umol <- nirs_baseline_table |>
+  dplyr::filter(.data$SEQ == "EX_STA") |>
+  dplyr::pull(.data$o2hb_baseline_umol)
+
+ex_sta_thb_baseline_umol <- nirs_baseline_table |>
+  dplyr::filter(.data$SEQ == "EX_STA") |>
+  dplyr::pull(.data$thb_baseline_umol)
+
+nirs_ex_sta_feature_table <- ex_sta_window_raw |>
+  dplyr::filter(.data$window_id >= ex_sta_onset_window_id) |>
+  dplyr::left_join(window_index_lookup, by = "window_id") |>
+  dplyr::mutate(
+    RUN_ID                  = .env$RUN_ID,
+    participant_id          = .env$participant_id,
+    source_sequence         = "EX_STA",
+    hhb_from_baseline_umol  = .data$mean_hhb_umol - .env$fresh_baseline_umol,
+    hhb_from_seq_rest_umol  = .data$mean_hhb_umol - .env$ex_sta_baseline_umol,
+    o2hb_from_seq_rest_umol = .data$mean_o2hb_umol - .env$ex_sta_o2hb_baseline_umol,
+    thb_from_seq_rest_umol  = .data$mean_thb_umol - .env$ex_sta_thb_baseline_umol,
+    evidence_status         = "provisional",
+    .before                 = 1
+  ) |>
+  dplyr::select(
+    RUN_ID, participant_id, source_sequence,
+    window_id, window_index,
+    window_mid_s, window_time_from_start_s,
+    mean_hhb_umol, hhb_from_baseline_umol, hhb_from_seq_rest_umol,
+    mean_o2hb_umol, o2hb_from_seq_rest_umol,
+    mean_thb_umol, thb_from_seq_rest_umol,
+    n_samples, evidence_status
+  ) |>
+  dplyr::arrange(.data$window_index)
+```
+
+# 9. Run-level summary table
+
+```{r build_nirs_run_summary_table}
+# Run-level scalars: linear slope over time, and last-minus-first delta, computed for each
+# listed NIRS variable on both EX_DYN (vs VC_count) and EX_STA (vs window_index).
+make_nirs_slope <- function(df, x_col, value_col, analysis_block, source_seq) {
+  df_clean <- df |>
+    dplyr::filter(is.finite(.data[[x_col]]), is.finite(.data[[value_col]])) |>
+    dplyr::arrange(.data[[x_col]])
+  if (nrow(df_clean) < 3L || dplyr::n_distinct(df_clean[[x_col]]) < 3L) return(NULL)
+  fit <- lm(reformulate(x_col, response = value_col), data = df_clean)
+  return(tibble::tibble(
+    analysis_block   = analysis_block,
+    summary_variable = value_col,
+    summary_type     = paste0(x_col, "_linear_slope"),
+    source_sequence  = source_seq,
+    summary_value    = unname(coef(fit)[[2]]),
+    n_points         = nrow(df_clean)
+  ))
+}
+
+make_nirs_last_minus_first <- function(df, x_col, value_col, analysis_block, source_seq) {
+  df_clean <- df |>
+    dplyr::filter(is.finite(.data[[x_col]]), is.finite(.data[[value_col]])) |>
+    dplyr::arrange(.data[[x_col]])
+  if (nrow(df_clean) < 2L) return(NULL)
+  return(tibble::tibble(
+    analysis_block   = analysis_block,
+    summary_variable = value_col,
+    summary_type     = "last_minus_first",
+    source_sequence  = source_seq,
+    summary_value    = dplyr::last(df_clean[[value_col]]) - dplyr::first(df_clean[[value_col]]),
+    n_points         = nrow(df_clean)
+  ))
+}
+
+ex_dyn_summary_vars <- c("mean_hhb_umol", "hhb_from_baseline_umol", "hhb_from_seq_rest_umol",
+                         "hhb_desat_umol", "hhb_slope_umol_s", "hhb_sat_umol",
+                         "o2hb_from_seq_rest_umol", "thb_from_seq_rest_umol")
+ex_sta_summary_vars <- c("mean_hhb_umol", "hhb_from_baseline_umol", "hhb_from_seq_rest_umol",
+                         "o2hb_from_seq_rest_umol", "thb_from_seq_rest_umol")
+
+nirs_run_summary_table <- dplyr::bind_rows(c(
+  lapply(ex_dyn_summary_vars, function(v)
+    make_nirs_slope(nirs_ex_dyn_feature_table, "VC_count", v, "nirs_ex_dyn", "EX_DYN")),
+  lapply(ex_dyn_summary_vars, function(v)
+    make_nirs_last_minus_first(nirs_ex_dyn_feature_table, "VC_count", v, "nirs_ex_dyn", "EX_DYN")),
+  lapply(ex_sta_summary_vars, function(v)
+    make_nirs_slope(nirs_ex_sta_feature_table, "window_index", v, "nirs_ex_sta", "EX_STA")),
+  lapply(ex_sta_summary_vars, function(v)
+    make_nirs_last_minus_first(nirs_ex_sta_feature_table, "window_index", v, "nirs_ex_sta", "EX_STA"))
+)) |>
+  dplyr::mutate(
+    RUN_ID          = .env$RUN_ID,
+    participant_id  = .env$participant_id,
+    evidence_status = "provisional",
+    .before         = 1
+  ) |>
+  dplyr::select(
+    RUN_ID, participant_id,
+    analysis_block, summary_variable,
+    summary_type, source_sequence,
+    summary_value, n_points, evidence_status
+  ) |>
+  dplyr::arrange(.data$analysis_block, .data$summary_variable, .data$summary_type)
+```
+
+# 9b. Signal quality QC
+
+```{r nirs_signal_qc}
+# Spike threshold (session-wide): clear motion artifact / probe displacement.
+# EX_STA bad-window threshold: probe movement during sustained hold (systematic in this cohort).
+NIRS_SPIKE_THRESHOLD_UMOL       <- 50L
+NIRS_EXSTA_SPIKE_THRESHOLD_UMOL <- 15L
+
+n_session_spikes <- nirs_raw |>
+  dplyr::summarise(
+    n = sum(abs(.data[[NIRS_SIGNAL_COL]]) > NIRS_SPIKE_THRESHOLD_UMOL, na.rm = TRUE)
+  ) |>
+  dplyr::pull(n)
+
+n_exdyn_bad_windows <- if (nrow(nirs_ex_dyn_feature_table) > 0L) {
+  nirs_ex_dyn_feature_table |>
+    dplyr::summarise(
+      n = sum(abs(.data$hhb_from_seq_rest_umol) > NIRS_EXSTA_SPIKE_THRESHOLD_UMOL, na.rm = TRUE)
+    ) |>
+    dplyr::pull(n)
+} else { 0L }
+
+n_exsta_bad_windows <- if (nrow(nirs_ex_sta_feature_table) > 0L) {
+  nirs_ex_sta_feature_table |>
+    dplyr::summarise(
+      n = sum(abs(.data$hhb_from_seq_rest_umol) > NIRS_EXSTA_SPIKE_THRESHOLD_UMOL, na.rm = TRUE)
+    ) |>
+    dplyr::pull(n)
+} else { 0L }
+
+# tHb direction during EX_DYN contractions: mean tHb (delta from session start) across all reps.
+# Healthy probe placement = blood pooling during contraction → tHb positive or near zero.
+# Negative mean tHb = blood expelled from measurement volume → probe over compressible superficial
+# structure (fascia / large vein), not the active capillary bed. Threshold -5 µmol/L confirmed
+# on 261PoLe (mean = -13.54) vs clean run 802BlHu (mean = +5.91).
+NIRS_THB_DEPLETION_THRESHOLD_UMOL <- -5L
+
+exdyn_thb_mean <- if (nrow(nirs_ex_dyn_feature_table) > 0L) {
+  round(mean(nirs_ex_dyn_feature_table$mean_thb_umol, na.rm = TRUE), 2)
+} else { NA_real_ }
+
+exdyn_thb_depletion_flag <- isTRUE(!is.na(exdyn_thb_mean) &&
+                                     exdyn_thb_mean < NIRS_THB_DEPLETION_THRESHOLD_UMOL)
+
+nirs_qc_table <- tibble::tibble(
+  RUN_ID                   = RUN_ID,
+  participant_id           = participant_id,
+  n_session_spikes         = n_session_spikes,
+  n_exdyn_bad_windows      = n_exdyn_bad_windows,
+  n_exsta_bad_windows      = n_exsta_bad_windows,
+  exsta_spike_flag         = n_exsta_bad_windows > 0L,
+  exdyn_thb_mean_umol      = exdyn_thb_mean,
+  exdyn_thb_depletion_flag = exdyn_thb_depletion_flag
+)
+
+cat("[NIRS QC]", RUN_ID,
+    "| session spikes (>50 µmol/L):", n_session_spikes,
+    "| EX_DYN bad windows:", n_exdyn_bad_windows,
+    "| EX_STA bad windows:", n_exsta_bad_windows,
+    "| EX_DYN tHb mean:", exdyn_thb_mean, "µmol/L",
+    "| tHb depletion flag:", exdyn_thb_depletion_flag, "\n")
+```
+
+# 10. Diagnostic plots
+
+```{r build_nirs_plots}
+plot_export_map <- list()
+
+# Baseline extraction windows: [onset + BASELINE_START_S, onset + BASELINE_END_S) per sequence.
+# Used for geom_rect annotations — lets you visually verify the window lands in clean rest signal.
+baseline_rects <- nirs_raw |>
+  dplyr::filter(.data$SEQ %in% critical_seqs, .data$VC == 1L) |>
+  dplyr::group_by(.data$SEQ) |>
+  dplyr::summarise(onset_s = min(.data$time_ref_s, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(
+    xmin = .data$onset_s + BASELINE_START_S,
+    xmax = .data$onset_s + BASELINE_END_S
+  )
+
+# --- 10.1 Full session overview ---
+nirs_session_plot <- ggplot(
+  nirs_raw,
+  aes(x = .data$time_ref_s, y = .data[[NIRS_SIGNAL_COL]], colour = .data$SEQ)
+) +
+  geom_rect(
+    data        = baseline_rects,
+    aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill        = "grey70", alpha = 0.35
+  ) +
+  geom_line(linewidth = 0.45, alpha = 0.85) +
+  labs(
+    title    = paste0("NIRS full session - ", RUN_ID),
+    subtitle = "Shaded bands = baseline extraction windows [-10s, -5s) before each sequence onset",
+    x        = "Session time (s)",
+    y        = "ΔHHb (µmol/L)",
+    colour   = "Sequence"
+  ) +
+  theme_amstrom_hgrid +
+  theme(legend.position = "right")
+
+plot_export_map[["session_overview"]] <- nirs_session_plot
+
+# --- 10.2 Reference and checkpoint ---
+ref_plot_levels <- c("SVC_30%", "SVC_50%", "SVC_70%", "MVC_REF", "MVC_RECOV_DYN", "MVC_RECOV_STA")
+
+nirs_ref_plot <- nirs_reference_feature_table |>
+  dplyr::filter(!is.na(.data$state_label)) |>
+  dplyr::group_by(.data$state_label) |>
+  dplyr::summarise(
+    hhb_from_baseline_umol = mean(.data$hhb_from_baseline_umol, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(state_label = factor(.data$state_label, levels = ref_plot_levels)) |>
+  ggplot(aes(x = .data$state_label, y = .data$hhb_from_baseline_umol, group = 1)) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_nirs) +
+  geom_point(shape = 15, size = 2.2, colour = col_nirs) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+  labs(
+    title = paste0("NIRS reference and checkpoint - ", RUN_ID),
+    x     = NULL,
+    y     = "ΔHHb from baseline (µmol/L)"
+  ) +
+  theme_amstrom_hgrid +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+plot_export_map[["reference_checkpoint"]] <- nirs_ref_plot
+
+# --- 10.3 EX_DYN - ΔHHb from baseline trajectory ---
+nirs_ex_dyn_plot <- ggplot(
+  nirs_ex_dyn_feature_table,
+  aes(x = .data$VC_count, y = .data$hhb_from_seq_rest_umol)
+) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_nirs) +
+  geom_point(shape = 15, size = 2.2, colour = col_nirs) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+  labs(
+    title = paste0("EX_DYN - ΔHHb trajectory - ", RUN_ID),
+    x     = "Repetition",
+    y     = "ΔHHb from seq. rest (µmol/L)"
+  ) +
+  theme_amstrom_hgrid
+
+plot_export_map[["ex_dyn_hhb"]] <- nirs_ex_dyn_plot
+
+# --- 10.4 EX_DYN - per-cycle features ---
+ex_dyn_features_long <- nirs_ex_dyn_feature_table |>
+  tidyr::pivot_longer(
+    cols      = c("hhb_desat_umol", "hhb_sat_umol", "hhb_slope_umol_s"),
+    names_to  = "feature",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(feature = factor(
+    .data$feature,
+    levels = c("hhb_desat_umol", "hhb_sat_umol", "hhb_slope_umol_s"),
+    labels = c("Desat amplitude (µmol/L)", "Reoxy amplitude (µmol/L)", "Onset slope (µmol/L/s)")
+  ))
+
+nirs_ex_dyn_features_plot <- ggplot(
+  ex_dyn_features_long,
+  aes(x = .data$VC_count, y = .data$value)
+) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_nirs) +
+  geom_point(shape = 15, size = 2.2, colour = col_nirs) +
+  facet_wrap(~ feature, ncol = 1, scales = "free_y") +
+  labs(
+    title = paste0("EX_DYN - per-cycle features - ", RUN_ID),
+    x     = "Repetition",
+    y     = NULL
+  ) +
+  theme_amstrom_hgrid
+
+plot_export_map[["ex_dyn_features"]] <- nirs_ex_dyn_features_plot
+
+# --- 10.5 EX_STA - ΔHHb trajectory ---
+nirs_ex_sta_plot <- ggplot(
+  nirs_ex_sta_feature_table,
+  aes(x = .data$window_index, y = .data$hhb_from_seq_rest_umol)
+) +
+  geom_line(linetype = "dotted", linewidth = 0.35, colour = col_nirs) +
+  geom_point(shape = 15, size = 2.2, colour = col_nirs) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey72", linewidth = 0.4) +
+  labs(
+    title = paste0("EX_STA - ΔHHb trajectory - ", RUN_ID),
+    x     = "Window index (1 s)",
+    y     = "ΔHHb from seq. rest (µmol/L)"
+  ) +
+  theme_amstrom_hgrid
+
+plot_export_map[["ex_sta_hhb"]] <- nirs_ex_sta_plot
+```
+
+```{r show_nirs_plots, fig.width=10, fig.height=6}
+if (isTRUE(SHOW_NIRS_PLOTS)) {
+  for (plot_name in names(plot_export_map)) {
+    print(plot_export_map[[plot_name]])
+  }
+}
+```
+
+```{r export_nirs_plots, message=FALSE}
+if (isTRUE(EXPORT_NIRS_PLOTS)) {
+  qc_export_path <- here::here("results", "QC_EXPORT", "nirs_individual_analysis",
+    paste0(RUN_ID, "_nirs_qc.pdf")
+  )
+  dir.create(dirname(qc_export_path), recursive = TRUE, showWarnings = FALSE)
+
+  grDevices::pdf(file = qc_export_path, width = 10, height = 6, onefile = TRUE)
+  for (plot_name in names(plot_export_map)) {
+    print(plot_export_map[[plot_name]])
+  }
+  grDevices::dev.off()
+
+  message(
+    "\n[NIRS QC EXPORT] PDF -> ",
+    normalizePath(qc_export_path, winslash = "/", mustWork = FALSE)
+  )
+}
+```
+
+# 11. Export analysis tables
+
+```{r export_analysis_tables, message=FALSE}
+# Write the per-run NIRS feature tables + QC table back to the run's export folder.
+EXPORT_NIRS_REFERENCE <- TRUE
+EXPORT_NIRS_EX_DYN    <- TRUE
+EXPORT_NIRS_EX_STA    <- TRUE
+EXPORT_NIRS_SUMMARY   <- TRUE
+EXPORT_NIRS_QC        <- TRUE
+
+analysis_export_map <- list(
+  nirs_reference_feature_table = nirs_reference_feature_table,
+  nirs_ex_dyn_feature_table    = nirs_ex_dyn_feature_table,
+  nirs_ex_sta_feature_table    = nirs_ex_sta_feature_table,
+  nirs_run_summary_table       = nirs_run_summary_table,
+  nirs_qc_table                = nirs_qc_table
+)
+
+analysis_export_flags <- c(
+  nirs_reference_feature_table = EXPORT_NIRS_REFERENCE,
+  nirs_ex_dyn_feature_table    = EXPORT_NIRS_EX_DYN,
+  nirs_ex_sta_feature_table    = EXPORT_NIRS_EX_STA,
+  nirs_run_summary_table       = EXPORT_NIRS_SUMMARY,
+  nirs_qc_table                = EXPORT_NIRS_QC
+)
+
+filename_map <- c(
+  nirs_reference_feature_table = "nirs_reference_feature_table.parquet",
+  nirs_ex_dyn_feature_table    = "nirs_ex_dyn_feature_table.parquet",
+  nirs_ex_sta_feature_table    = "nirs_ex_sta_feature_table.parquet",
+  nirs_run_summary_table       = "nirs_run_summary_table.parquet",
+  nirs_qc_table                = "nirs_qc_table.parquet"
+)
+
+if (isTRUE(EXPORT_ANALYSIS_TABLES)) {
+  for (tbl_name in names(analysis_export_map)) {
+    if (!isTRUE(analysis_export_flags[[tbl_name]])) next
+    out_path <- file.path(run_directory, filename_map[[tbl_name]])
+    arrow::write_parquet(analysis_export_map[[tbl_name]], out_path)
+    message(
+      "[NIRS EXPORT] ", filename_map[[tbl_name]], " -> ",
+      normalizePath(out_path, winslash = "/", mustWork = FALSE)
+    )
+  }
+}
+```
